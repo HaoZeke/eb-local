@@ -43,15 +43,30 @@ if [ -d "$prefix" ]; then
     prefix=$(cd "$prefix" && pwd -P)
 fi
 
-if [ "$mode" = project ]; then
-    set_line="export EESSI_PROJECT_INSTALL=$prefix"
-else
-    set_line="export EESSI_USER_INSTALL=$prefix"
-fi
+clear_install_environment() {
+    unset EESSI_CVMFS_INSTALL EESSI_SITE_INSTALL EESSI_USER_INSTALL EESSI_PROJECT_INSTALL
+    unset EESSI_SITE_SOFTWARE_PREFIX
+    unset EESSI_SOFTWARE_SUBDIR_OVERRIDE EESSI_ACCELERATOR_TARGET_OVERRIDE EESSI_OVERRIDE_GPU_CHECK
+    unset EASYBUILD_INSTALLPATH EASYBUILD_INSTALLPATH_SOFTWARE EASYBUILD_INSTALLPATH_MODULES EASYBUILD_PREFIX
+}
+
+print_environment() {
+    printf '%s\n' 'module unload EESSI-extend/2026.06-easybuild >/dev/null 2>&1 || true'
+    printf '%s\n' \
+        'unset EESSI_CVMFS_INSTALL EESSI_SITE_INSTALL EESSI_USER_INSTALL EESSI_PROJECT_INSTALL' \
+        'unset EESSI_SITE_SOFTWARE_PREFIX' \
+        'unset EESSI_SOFTWARE_SUBDIR_OVERRIDE EESSI_ACCELERATOR_TARGET_OVERRIDE EESSI_OVERRIDE_GPU_CHECK' \
+        'unset EASYBUILD_INSTALLPATH EASYBUILD_INSTALLPATH_SOFTWARE EASYBUILD_INSTALLPATH_MODULES EASYBUILD_PREFIX'
+    if [ "$mode" = project ]; then
+        printf 'export EESSI_PROJECT_INSTALL=%q\n' "$prefix"
+    else
+        printf 'export EESSI_USER_INSTALL=%q\n' "$prefix"
+    fi
+    printf '%s\n' 'module load EESSI/2026.06 EESSI-extend/2026.06-easybuild'
+}
 
 if [ "$env_only" = true ]; then
-    echo "$set_line"
-    echo "module load EESSI/2026.06 EESSI-extend/2026.06-easybuild"
+    print_environment
     exit 0
 fi
 
@@ -72,12 +87,6 @@ work="/scratch-shared/$USER/eb"
 mkdir -p "$work/tmp" "$work/sources"
 work=$(cd "$work" && pwd -P)
 
-unset EESSI_CVMFS_INSTALL EESSI_SITE_INSTALL EESSI_USER_INSTALL EESSI_PROJECT_INSTALL
-if [ "$mode" = project ]; then
-    export EESSI_PROJECT_INSTALL="$prefix"
-else
-    export EESSI_USER_INSTALL="$prefix"
-fi
 export WORKING_DIR="$work"
 export TMPDIR="$work/tmp"
 export EASYBUILD_SOURCEPATH="$work/sources"
@@ -93,7 +102,13 @@ fi
 type module >/dev/null 2>&1 || { echo "eb-local: no module command found" >&2; exit 1; }
 
 # EESSI-extend reads the variables above when it loads, so load it fresh.
-module unload EESSI-extend >/dev/null 2>&1 || true
+module unload EESSI-extend/2026.06-easybuild >/dev/null 2>&1 || true
+clear_install_environment
+if [ "$mode" = project ]; then
+    export EESSI_PROJECT_INSTALL="$prefix"
+else
+    export EESSI_USER_INSTALL="$prefix"
+fi
 module load EESSI/2026.06 EESSI-extend/2026.06-easybuild >/dev/null 2>&1 || {
     echo "eb-local: could not load EESSI/2026.06 and EESSI-extend/2026.06-easybuild" >&2
     exit 1
@@ -106,7 +121,6 @@ eb --umask=022 "${args[@]}" || rc=$?
 if [ "$rc" -eq 0 ]; then
     echo
     echo "eb-local: done. To use the modules in a new shell or job:"
-    echo "  $set_line"
-    echo "  module load EESSI/2026.06 EESSI-extend/2026.06-easybuild"
+    print_environment
 fi
 exit "$rc"

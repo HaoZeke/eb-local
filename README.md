@@ -40,7 +40,7 @@ Everything after the options goes to `eb` unchanged, and `eb-local` exits with `
 ## Install
 
 `eb-local` is one Bash script with no dependencies beyond Lmod and an EESSI 2026.06 mount.
-Copy it onto `PATH`, or install it with the easyconfig `eb-local-1.0.eb`.
+Copy it onto `PATH`, or install it with the easyconfig `eb-local-1.1.eb`.
 
 ## License
 
