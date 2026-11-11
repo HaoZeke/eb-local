@@ -1,0 +1,112 @@
+#!/bin/bash
+# eb-local: install software with EasyBuild on top of EESSI 2026.06, into a
+# directory you own. The 2026 replacement for eblocalinstall.
+#
+#   eb-local <easyconfig> [eb options]     build and install
+#   eb-local --project DIR <easyconfig>    install into a shared project directory
+#   eb-local --env [--project DIR]         print the lines that make the modules visible
+#   eb-local --help
+#
+# Installs go to $HOME/.local/eessi (or the project directory), which persists.
+# Builds, temporary files and downloaded sources go to /scratch-shared/$USER/eb,
+# which expires. EESSI-extend supplies EESSI's hooks, RPATH and compat layer.
+set -eo pipefail   # no -u: the Lmod init reads unset variables
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+
+prefix="${EB_LOCAL_PREFIX:-$HOME/.local/eessi}"
+mode=user
+env_only=false
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --env) env_only=true; shift ;;
+        --project)
+            [ -n "${2:-}" ] || { echo "eb-local: --project needs a directory" >&2; exit 2; }
+            prefix="$2"; mode=project; shift 2 ;;
+        --project=*) prefix="${1#--project=}"; mode=project; shift ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+
+if [ "$mode" = project ] && [ ! -d "$prefix" ]; then
+    echo "eb-local: project directory $prefix does not exist." >&2
+    echo "  The project owner creates it once, with the project group and g+s:" >&2
+    echo "  mkdir -p $prefix && chgrp <group> $prefix && chmod 2770 $prefix" >&2
+    exit 2
+fi
+if [ "$env_only" != true ]; then
+    mkdir -p "$prefix"
+fi
+if [ -d "$prefix" ]; then
+    prefix=$(cd "$prefix" && pwd -P)
+fi
+
+if [ "$mode" = project ]; then
+    set_line="export EESSI_PROJECT_INSTALL=$prefix"
+else
+    set_line="export EESSI_USER_INSTALL=$prefix"
+fi
+
+if [ "$env_only" = true ]; then
+    echo "$set_line"
+    echo "module load EESSI/2026.06 EESSI-extend/2026.06-easybuild"
+    exit 0
+fi
+
+if [ ${#args[@]} -eq 0 ]; then
+    usage >&2
+    exit 2
+fi
+
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+    echo "eb-local: not inside a Slurm job." >&2
+    echo "  Software is built for the CPU of the node that runs eb-local, so build" >&2
+    echo "  inside an allocation on the node type that will run it, for example:" >&2
+    echo "  salloc -p rome -n 16 -t 02:00:00" >&2
+    exit 2
+fi
+
+work="/scratch-shared/$USER/eb"
+mkdir -p "$work/tmp" "$work/sources"
+work=$(cd "$work" && pwd -P)
+
+unset EESSI_CVMFS_INSTALL EESSI_SITE_INSTALL EESSI_USER_INSTALL EESSI_PROJECT_INSTALL
+if [ "$mode" = project ]; then
+    export EESSI_PROJECT_INSTALL="$prefix"
+else
+    export EESSI_USER_INSTALL="$prefix"
+fi
+export WORKING_DIR="$work"
+export TMPDIR="$work/tmp"
+export EASYBUILD_SOURCEPATH="$work/sources"
+export LMOD_EXACT_MATCH=no
+
+# A script only has `module` if the calling shell exported it.
+if ! type module >/dev/null 2>&1; then
+    for init in "${LMOD_PKG:-/usr/share/lmod/lmod}/init/bash" /etc/profile.d/lmod.sh; do
+        # shellcheck source=/dev/null
+        [ -r "$init" ] && { source "$init"; break; }
+    done
+fi
+type module >/dev/null 2>&1 || { echo "eb-local: no module command found" >&2; exit 1; }
+
+# EESSI-extend reads the variables above when it loads, so load it fresh.
+module unload EESSI-extend >/dev/null 2>&1 || true
+module load EESSI/2026.06 EESSI-extend/2026.06-easybuild >/dev/null 2>&1 || {
+    echo "eb-local: could not load EESSI/2026.06 and EESSI-extend/2026.06-easybuild" >&2
+    exit 1
+}
+
+echo "eb-local: installing into $prefix (${mode})"
+echo "eb-local: target $EESSI_SOFTWARE_SUBDIR${EESSI_ACCELERATOR_TARGET:+ + $EESSI_ACCELERATOR_TARGET}, build space $work"
+rc=0
+eb --umask=022 "${args[@]}" || rc=$?
+if [ "$rc" -eq 0 ]; then
+    echo
+    echo "eb-local: done. To use the modules in a new shell or job:"
+    echo "  $set_line"
+    echo "  module load EESSI/2026.06 EESSI-extend/2026.06-easybuild"
+fi
+exit "$rc"
