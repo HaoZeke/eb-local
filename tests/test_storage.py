@@ -1,6 +1,7 @@
 """Exercise storage refusal and workspace routing with controlled mount metadata."""
 import json
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import tempfile
@@ -65,7 +66,7 @@ class StorageControls(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
         self.nodes = self.root / "node-mounts"
-        self.job = self.nodes / "job.123"
+        self.job = self.nodes / (pwd.getpwuid(os.getuid()).pw_name + ".123")
         self.job.mkdir(parents=True)
         self.prefix = self.root / "durable" / "owned prefix"
         self.script = self.root / "eb-local"
@@ -103,6 +104,10 @@ class StorageControls(unittest.TestCase):
         self.refused(SLURM_JOB_ID="not-a-job")
 
     def test_shared_tmpdir_is_refused_before_prefix_creation(self):
+        other = self.nodes / "other-job.123"
+        self.job.rename(other)
+        self.job = other
+        self.env["CONTROL_JOB_ROOT"] = str(other)
         self.refused(TMPDIR=str(self.root))
 
     def test_gpfs_mount_is_refused(self):
@@ -121,14 +126,16 @@ class StorageControls(unittest.TestCase):
         self.refused(CONTROL_MOUNT_OPTIONS="ro,relatime")
 
     def test_symlink_root_is_refused(self):
-        link = self.nodes / "alias"
-        link.symlink_to(self.job, target_is_directory=True)
-        self.refused(TMPDIR=str(link))
+        real = self.root / "real-job"
+        self.job.rename(real)
+        self.job.symlink_to(real, target_is_directory=True)
+        self.refused(TMPDIR=str(self.job))
 
     def test_parent_symlink_escape_is_refused(self):
-        link = self.root / "alias"
-        link.symlink_to(self.nodes, target_is_directory=True)
-        self.refused(TMPDIR=str(link / self.job.name))
+        real = self.root / "real-node-mounts"
+        self.nodes.rename(real)
+        self.nodes.symlink_to(real, target_is_directory=True)
+        self.refused(TMPDIR=str(self.job))
 
     def test_build_paths_survive_unload_and_module_initialization(self):
         args = ["recipe with spaces.eb", "--hooks=/selected/custom.py", "--robot"]
@@ -170,11 +177,10 @@ class StorageControls(unittest.TestCase):
 
 
     def test_alias_inside_mount_namespace_cannot_escape_to_another_directory(self):
-        outside = self.root / "outside"
-        (outside / self.job.name).mkdir(parents=True)
-        link = self.nodes / "redirect"
-        link.symlink_to(outside, target_is_directory=True)
-        self.refused(TMPDIR=str(link / self.job.name))
+        other = self.nodes / "other-allocation"
+        self.job.rename(other)
+        self.job.symlink_to(other, target_is_directory=True)
+        self.refused(TMPDIR=str(self.job))
 
     def test_durable_sources_cannot_be_redirected_into_job_storage(self):
         (self.prefix / ".eb-local").mkdir(parents=True)

@@ -5,12 +5,12 @@ from pathlib import Path
 import pwd
 import unittest
 
-from test_storage import StorageControls
+import test_storage as storage
 
 
 class CurrentJobStorageControls(unittest.TestCase):
     def setUp(self):
-        self.fixture = StorageControls("test_build_paths_survive_unload_and_module_initialization")
+        self.fixture = storage.StorageControls("test_build_paths_survive_unload_and_module_initialization")
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         selected = self.fixture.nodes / (pwd.getpwuid(os.getuid()).pw_name + ".123")

@@ -6,6 +6,7 @@ They do not establish the destination chosen by a native EESSI extension.
 """
 import json
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import tempfile
@@ -54,6 +55,15 @@ cd() {
     esac
 }
 export -f module eb mkdir cd
+findmnt() {
+    case "$3" in
+        FSTYPE) printf '%s\n' xfs;;
+        TARGET) printf '%s\n' "$CONTROL_JOB_ROOT";;
+        OPTIONS) printf '%s\n' rw,relatime;;
+        *) return 99;;
+    esac
+}
+export -f findmnt
 '''
 CAPTURE = r'''
 import json, os, sys
@@ -83,6 +93,11 @@ class EnvironmentControls(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="controls-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
+        self.nodes = self.root / "node-mounts"
+        self.job = self.nodes / (pwd.getpwuid(os.getuid()).pw_name + ".123")
+        self.job.mkdir(parents=True)
+        self.script = self.root / "eb-local"
+        self.script.write_text(SCRIPT.read_text().replace("/scratch-node", str(self.nodes)))
         (self.root / "doubles.sh").write_text(DOUBLE)
         (self.root / "capture.py").write_text(CAPTURE)
         self.prefix = self.root / "owned space 'quote' $(touch injected)"
@@ -91,11 +106,11 @@ class EnvironmentControls(unittest.TestCase):
                         CONTROL_ROOT=str(self.root), CONTROL_CLEAR=" ".join(CLEAR),
                         CONTROL_PREFIX=str(self.prefix), CONTROL_MODE="EESSI_USER_INSTALL",
                         EB_LOCAL_PREFIX=str(self.prefix), USER="fixture",
-                        SLURM_JOB_ID="123")
+                        SLURM_JOB_ID="123", TMPDIR=str(self.job), CONTROL_JOB_ROOT=str(self.job))
         self.env.update({name: "inherited" for name in CLEAR})
 
     def run_wrapper(self, arguments, **extra):
-        return subprocess.run(["bash", str(SCRIPT)] + arguments,
+        return subprocess.run(["bash", str(self.script)] + arguments,
                               env=dict(self.env, **extra), cwd=self.root, text=True, capture_output=True)
 
     def check_build(self, mode, status=0):
