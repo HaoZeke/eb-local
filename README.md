@@ -33,13 +33,15 @@ eb-local --project /projects/myproj/eessi GSL-2.8-GCC-15.2.0.eb --robot
 | what | where |
 |---|---|
 | installs | `$HOME/.local/eessi`, `EB_LOCAL_PREFIX`, or `--project DIR` |
-| build, temporary, cache and EESSI setup directories | a unique workspace in the allocation's `TMPDIR` |
+| build, temporary, cache and EESSI setup directories | a unique workspace in the allocation's node-local mount |
 | downloaded source archives | `<install-prefix>/.eb-local/sources` |
 | build logs | `<install-prefix>/.eb-local/logs` |
 
-Build mode requires a numeric Slurm allocation ID and an owned, writable,
-canonical `TMPDIR` that is its own XFS mount below `/scratch-node`.
-Shared GPFS paths, tmpfs, enclosing mounts and symlink aliases are refused
+Build mode requires a numeric Slurm allocation ID. It derives
+`/scratch-node/$(id -un).$SLURM_JOB_ID` from the actual user identity and
+allocation, then requires that owned, writable, canonical directory to be
+its own XFS mount. An inherited shared or nested `TMPDIR` does not select
+the build filesystem. Shared GPFS paths, tmpfs, enclosing mounts and symlink aliases are refused
 before the installation prefix is created. There is no shared-scratch fallback.
 The scheduler owns the lifetime of the job workspace; sources and logs remain
 with the user or project installation. `--help` and `--env` create no directories

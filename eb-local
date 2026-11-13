@@ -87,21 +87,22 @@ fail_storage() {
 }
 
 # The scheduler's exact job mount keeps mutable work outside shared quotas.
-job_root="${TMPDIR:-}"
+[[ "$SLURM_JOB_ID" =~ ^[1-9][0-9]*$ ]] || fail_storage 'invalid Slurm allocation identity.'
+job_user=$(id -un) || fail_storage 'cannot determine the allocation user.'
+job_root="/scratch-node/${job_user}.${SLURM_JOB_ID}"
 case "$job_root" in
     /scratch-node/*) ;;
-    *) fail_storage 'TMPDIR must name the allocation mount below /scratch-node.' ;;
+    *) fail_storage 'node-local root must name the allocation mount below /scratch-node.' ;;
 esac
-[[ "$SLURM_JOB_ID" =~ ^[1-9][0-9]*$ ]] || fail_storage 'invalid Slurm allocation identity.'
 [ -d "$job_root" ] && [ ! -L "$job_root" ] && [ -w "$job_root" ] && [ -x "$job_root" ] ||
-    fail_storage 'allocation TMPDIR must be an owned writable directory.'
-canonical_root=$(readlink -e -- "$job_root") || fail_storage 'cannot resolve allocation TMPDIR.'
-[ "$canonical_root" = "$job_root" ] || fail_storage 'allocation TMPDIR must be canonical.'
-[ "$(stat -c %u -- "$job_root")" = "$(id -u)" ] || fail_storage 'allocation TMPDIR belongs to another user.'
+    fail_storage 'allocation node-local root must be an owned writable directory.'
+canonical_root=$(readlink -e -- "$job_root") || fail_storage 'cannot resolve allocation node-local root.'
+[ "$canonical_root" = "$job_root" ] || fail_storage 'allocation node-local root must be canonical.'
+[ "$(stat -c %u -- "$job_root")" = "$(id -u)" ] || fail_storage 'allocation node-local root belongs to another user.'
 [ "$(findmnt -n -o FSTYPE --target "$job_root")" = xfs ] ||
-    fail_storage 'allocation TMPDIR must use XFS, not shared or memory-backed storage.'
+    fail_storage 'allocation node-local root must use XFS, not shared or memory-backed storage.'
 [ "$(findmnt -n -o TARGET --target "$job_root")" = "$job_root" ] ||
-    fail_storage 'allocation TMPDIR must be its own mount.'
+    fail_storage 'allocation node-local root must be its own mount.'
 mount_options=$(findmnt -n -o OPTIONS --target "$job_root") ||
     fail_storage 'cannot inspect allocation mount options.'
 case ",$mount_options," in
