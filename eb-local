@@ -117,8 +117,15 @@ esac
 mkdir -p -- "$prefix"
 [ -w "$prefix" ] && [ -x "$prefix" ] || fail_storage 'installation prefix is not writable.'
 prefix=$(cd "$prefix" && pwd -P)
-work=$(mktemp -d "$job_root/eb-local.XXXXXXXX") || fail_storage 'cannot create allocation workspace.'
 durable="$prefix/.eb-local"
+for durable_path in "$durable/sources" "$durable/logs"; do
+    resolved_path=$(readlink -m -- "$durable_path") || fail_storage 'cannot resolve durable source or log directory.'
+    case "$resolved_path" in
+        "$prefix"/*) ;;
+        *) fail_storage 'source and log directories must remain inside the durable prefix.' ;;
+    esac
+done
+work=$(mktemp -d "$job_root/eb-local.XXXXXXXX") || fail_storage 'cannot create allocation workspace.'
 mkdir -p -- "$work/build" "$work/tmp" "$work/cache" "$work/cargo" "$work/source-index" \
     "$durable/sources" "$durable/logs"
 
