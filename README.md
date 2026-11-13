@@ -10,7 +10,7 @@ EESSI-extend supplies EESSI's hooks, RPATH wrappers and compat layer, so what yo
 Build inside a Slurm allocation on the node type that will run the software, because EasyBuild targets the CPU of the node it runs on:
 
 ```sh
-salloc -p rome -n 16 -t 02:00:00 --constraint=scratch-node
+salloc -p <partition> -n 16 -t 02:00:00   # on nodes with a node-local disk
 eb-local GSL-2.8-GCC-15.2.0.eb --robot
 ```
 
@@ -24,8 +24,8 @@ module avail
 For a group install, the project owner creates the directory once with the project group and the setgid bit:
 
 ```sh
-mkdir -p /projects/myproj/eessi && chgrp myproj /projects/myproj/eessi && chmod 2770 /projects/myproj/eessi
-eb-local --project /projects/myproj/eessi GSL-2.8-GCC-15.2.0.eb --robot
+mkdir -p /path/to/project/eessi && chgrp myproj /path/to/project/eessi && chmod 2770 /path/to/project/eessi
+eb-local --project /path/to/project/eessi GSL-2.8-GCC-15.2.0.eb --robot
 ```
 
 ## Where things go
@@ -38,10 +38,10 @@ eb-local --project /projects/myproj/eessi GSL-2.8-GCC-15.2.0.eb --robot
 | build logs | `<install-prefix>/.eb-local/logs` |
 
 Build mode requires a numeric Slurm allocation ID. It derives
-`/scratch-node/$(id -un).$SLURM_JOB_ID` from the actual user identity and
+the allocation's node-local directory from the actual user identity and
 allocation, then requires that owned, writable, canonical directory to be
 its own XFS mount. An inherited shared or nested `TMPDIR` does not select
-the build filesystem. Shared GPFS paths, tmpfs, enclosing mounts and symlink aliases are refused
+the build filesystem. Shared parallel-filesystem paths, tmpfs, enclosing mounts and symlink aliases are refused
 before the installation prefix is created. There is no shared-scratch fallback.
 The scheduler owns the lifetime of the job workspace; sources and logs remain
 with the user or project installation. `--help` and `--env` create no directories
