@@ -169,5 +169,28 @@ class StorageControls(unittest.TestCase):
         self.assertEqual(list(self.job.iterdir()), [])
 
 
+    def test_alias_inside_mount_namespace_cannot_escape_to_another_directory(self):
+        outside = self.root / "outside"
+        (outside / self.job.name).mkdir(parents=True)
+        link = self.nodes / "redirect"
+        link.symlink_to(outside, target_is_directory=True)
+        self.refused(TMPDIR=str(link / self.job.name))
+
+    def test_durable_sources_cannot_be_redirected_into_job_storage(self):
+        (self.prefix / ".eb-local").mkdir(parents=True)
+        (self.prefix / ".eb-local" / "sources").symlink_to(self.job, target_is_directory=True)
+        run = self.run_wrapper()
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertFalse((self.root / "load.json").exists())
+        self.assertEqual(list(self.job.iterdir()), [])
+
+    def test_install_prefix_cannot_use_job_storage(self):
+        destination = self.job / "install"
+        run = self.run_wrapper(EB_LOCAL_PREFIX=str(destination))
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.job.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()
