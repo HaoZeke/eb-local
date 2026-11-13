@@ -77,7 +77,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "eb-local: not inside a Slurm job." >&2
     echo "  Software is built for the CPU of the node that runs eb-local, so build" >&2
     echo "  inside an allocation on the node type that will run it, for example:" >&2
-    echo "  salloc -p rome -n 16 -t 02:00:00" >&2
+    echo "  salloc -p rome -n 16 -t 02:00:00 --constraint=scratch-node" >&2
     exit 2
 fi
 
