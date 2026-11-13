@@ -8,8 +8,9 @@
 #   eb-local --help
 #
 # Installs go to $HOME/.local/eessi (or the project directory), which persists.
-# Builds, temporary files and downloaded sources go to /scratch-shared/$USER/eb,
-# which expires. EESSI-extend supplies EESSI's hooks, RPATH and compat layer.
+# Mutable work uses the allocation's owned XFS mount under /scratch-node.
+# Sources and logs persist beside the installation. EESSI-extend supplies
+# EESSI's hooks, RPATH and compat layer.
 set -eo pipefail   # no -u: the Lmod init reads unset variables
 
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -35,9 +36,6 @@ if [ "$mode" = project ] && [ ! -d "$prefix" ]; then
     echo "  The project owner creates it once, with the project group and g+s:" >&2
     echo "  mkdir -p $prefix && chgrp <group> $prefix && chmod 2770 $prefix" >&2
     exit 2
-fi
-if [ "$env_only" != true ]; then
-    mkdir -p "$prefix"
 fi
 if [ -d "$prefix" ]; then
     prefix=$(cd "$prefix" && pwd -P)
@@ -83,13 +81,55 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     exit 2
 fi
 
-work="/scratch-shared/$USER/eb"
-mkdir -p "$work/tmp" "$work/sources"
-work=$(cd "$work" && pwd -P)
+fail_storage() {
+    echo "eb-local: $*" >&2
+    exit 2
+}
 
-export WORKING_DIR="$work"
-export TMPDIR="$work/tmp"
-export EASYBUILD_SOURCEPATH="$work/sources"
+# The scheduler's exact job mount keeps mutable work outside shared quotas.
+job_root="${TMPDIR:-}"
+case "$job_root" in
+    /scratch-node/*) ;;
+    *) fail_storage 'TMPDIR must name the allocation mount below /scratch-node.' ;;
+esac
+[[ "$SLURM_JOB_ID" =~ ^[1-9][0-9]*$ ]] || fail_storage 'invalid Slurm allocation identity.'
+[ -d "$job_root" ] && [ ! -L "$job_root" ] && [ -w "$job_root" ] && [ -x "$job_root" ] ||
+    fail_storage 'allocation TMPDIR must be an owned writable directory.'
+canonical_root=$(readlink -e -- "$job_root") || fail_storage 'cannot resolve allocation TMPDIR.'
+[ "$canonical_root" = "$job_root" ] || fail_storage 'allocation TMPDIR must be canonical.'
+[ "$(stat -c %u -- "$job_root")" = "$(id -u)" ] || fail_storage 'allocation TMPDIR belongs to another user.'
+[ "$(findmnt -n -o FSTYPE --target "$job_root")" = xfs ] ||
+    fail_storage 'allocation TMPDIR must use XFS, not shared or memory-backed storage.'
+[ "$(findmnt -n -o TARGET --target "$job_root")" = "$job_root" ] ||
+    fail_storage 'allocation TMPDIR must be its own mount.'
+mount_options=$(findmnt -n -o OPTIONS --target "$job_root") ||
+    fail_storage 'cannot inspect allocation mount options.'
+case ",$mount_options," in
+    *,rw,*) ;;
+    *) fail_storage 'allocation mount is not writable.' ;;
+esac
+
+prefix=$(readlink -m -- "$prefix") || fail_storage 'cannot resolve installation prefix.'
+case "$prefix" in
+    /scratch-node|/scratch-node/*|/scratch-shared|/scratch-shared/*|/scratch-local|/scratch-local/*|/gpfs/scratch1|/gpfs/scratch1/*)
+        fail_storage 'installation, source and log paths must use durable owned storage.' ;;
+esac
+mkdir -p -- "$prefix"
+[ -w "$prefix" ] && [ -x "$prefix" ] || fail_storage 'installation prefix is not writable.'
+prefix=$(cd "$prefix" && pwd -P)
+work=$(mktemp -d "$job_root/eb-local.XXXXXXXX") || fail_storage 'cannot create allocation workspace.'
+durable="$prefix/.eb-local"
+mkdir -p -- "$work/build" "$work/tmp" "$work/cache" "$work/cargo" "$work/source-index" \
+    "$durable/sources" "$durable/logs"
+
+select_storage_environment() {
+    export WORKING_DIR="$work/source-index"
+    export TMPDIR="$work/tmp" TMP="$work/tmp" TEMP="$work/tmp"
+    export EASYBUILD_BUILDPATH="$work/build" EASYBUILD_TMPDIR="$work/tmp"
+    export XDG_CACHE_HOME="$work/cache" CARGO_HOME="$work/cargo"
+    export EASYBUILD_SOURCEPATH="$durable/sources" EASYBUILD_TMP_LOGDIR="$durable/logs"
+}
+select_storage_environment
 export LMOD_EXACT_MATCH=no
 
 # A script only has `module` if the calling shell exported it.
@@ -104,6 +144,7 @@ type module >/dev/null 2>&1 || { echo "eb-local: no module command found" >&2; e
 # EESSI-extend reads the variables above when it loads, so load it fresh.
 module unload EESSI-extend/2026.06-easybuild >/dev/null 2>&1 || true
 clear_install_environment
+select_storage_environment
 if [ "$mode" = project ]; then
     export EESSI_PROJECT_INSTALL="$prefix"
 else
@@ -113,6 +154,7 @@ module load EESSI/2026.06 EESSI-extend/2026.06-easybuild >/dev/null 2>&1 || {
     echo "eb-local: could not load EESSI/2026.06 and EESSI-extend/2026.06-easybuild" >&2
     exit 1
 }
+select_storage_environment
 
 echo "eb-local: installing into $prefix (${mode})"
 echo "eb-local: target $EESSI_SOFTWARE_SUBDIR${EESSI_ACCELERATOR_TARGET:+ + $EESSI_ACCELERATOR_TARGET}, build space $work"
