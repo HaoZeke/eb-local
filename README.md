@@ -52,7 +52,7 @@ Everything after the options goes to `eb` unchanged, and `eb-local` exits with `
 ## Install
 
 `eb-local` is one Bash script using GNU coreutils, util-linux `findmnt`, Lmod and an EESSI 2026.06 mount.
-Copy it onto `PATH`, or install it with the easyconfig the matching released easyconfig.
+Copy it onto `PATH`, or install it with the matching released easyconfig.
 
 ## License
 
