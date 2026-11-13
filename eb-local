@@ -8,12 +8,12 @@
 #   eb-local --help
 #
 # Installs go to $HOME/.local/eessi (or the project directory), which persists.
-# Mutable work uses the allocation's owned XFS mount under /scratch-node.
-# Sources and logs persist beside the installation. EESSI-extend supplies
-# EESSI's hooks, RPATH and compat layer.
+# Mutable work uses the allocation's own node-local mount, named in the site
+# configuration (eb-local.conf). Sources and logs persist beside the
+# installation. EESSI-extend supplies EESSI's hooks, RPATH and compat layer.
 set -eo pipefail   # no -u: the Lmod init reads unset variables
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
 
 prefix="${EB_LOCAL_PREFIX:-$HOME/.local/eessi}"
 mode=user
@@ -73,34 +73,107 @@ if [ ${#args[@]} -eq 0 ]; then
     exit 2
 fi
 
-if [ -z "${SLURM_JOB_ID:-}" ]; then
-    echo "eb-local: not inside a Slurm job." >&2
-    echo "  Software is built for the CPU of the node that runs eb-local, so build" >&2
-    echo "  inside an allocation on the node type that will run it, for example:" >&2
-    echo "  salloc -p rome -n 16 -t 02:00:00 --constraint=scratch-node" >&2
-    exit 2
-fi
-
 fail_storage() {
     echo "eb-local: $*" >&2
     exit 2
 }
 
+# Site configuration. The file is parsed, never sourced. It is trusted only
+# when it is a regular file, not a symlink, not writable by group or others,
+# and owned by root, by the owner of this script (the installer), or by the
+# caller (whose builds alone it steers). Search order: EB_LOCAL_CONFIG, then
+# eb-local.conf beside the resolved script, then /etc/eb-local.conf.
+#   node_local_root = /path    allocation mounts are <root>/<user>.<job id>
+#   node_local_fstype = xfs    file system type the allocation mount must have
+#   shared_scratch = /a /b     shared scratch trees refused as install prefix
+#   allocation_hint = text     example allocation printed outside a job
+node_local_root=""
+node_local_fstype=xfs
+shared_scratch=""
+allocation_hint=""
+config_file=""
+
+config_trusted() {
+    local file="$1" owner mode script_owner
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    owner=$(stat -c %u -- "$file") || return 1
+    mode=$(stat -c %a -- "$file") || return 1
+    [ $(( 8#$mode & 8#022 )) -eq 0 ] || { echo "eb-local: $file is writable by group or others and is ignored" >&2; return 1; }
+    script_owner=$(stat -c %u -- "$(readlink -f -- "$0")") || script_owner=0
+    case "$owner" in
+        0|"$script_owner"|"$(id -u)") return 0 ;;
+    esac
+    echo "eb-local: $file is owned by uid $owner and is ignored" >&2
+    return 1
+}
+
+read_config() {
+    local file="$1" line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*([a-z_]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])?[[:space:]]*$ ]] ||
+            fail_storage "$file: cannot read the line '$line'."
+        key="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}"
+        case "$key" in
+            node_local_root)
+                [[ "$value" =~ ^/[^[:space:]]*[^/[:space:]]$ ]] ||
+                    fail_storage "$file: node_local_root must be one absolute path without a trailing slash."
+                node_local_root="$value" ;;
+            node_local_fstype)
+                [[ "$value" =~ ^[a-z0-9_.]+$ ]] || fail_storage "$file: node_local_fstype must be a file system type name."
+                node_local_fstype="$value" ;;
+            shared_scratch)
+                local path
+                for path in $value; do
+                    [[ "$path" =~ ^/.*[^/]$ ]] || fail_storage "$file: shared_scratch takes absolute paths without a trailing slash."
+                done
+                shared_scratch="$value" ;;
+            allocation_hint) allocation_hint="$value" ;;
+            *) fail_storage "$file: unknown setting '$key'." ;;
+        esac
+    done < "$file"
+}
+
+script_dir=$(dirname -- "$(readlink -f -- "$0")")
+for candidate in ${EB_LOCAL_CONFIG:+"$EB_LOCAL_CONFIG"} "$script_dir/eb-local.conf" /etc/eb-local.conf; do
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        if config_trusted "$candidate"; then
+            config_file="$candidate"
+            break
+        fi
+        [ "$candidate" = "${EB_LOCAL_CONFIG:-}" ] && fail_storage "EB_LOCAL_CONFIG names a file that is not trusted."
+    elif [ "$candidate" = "${EB_LOCAL_CONFIG:-}" ]; then
+        fail_storage "EB_LOCAL_CONFIG names $candidate, which does not exist."
+    fi
+done
+[ -z "$config_file" ] || read_config "$config_file"
+
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+    echo "eb-local: not inside a Slurm job." >&2
+    echo "  Software is built for the CPU of the node that runs eb-local, so build" >&2
+    echo "  inside an allocation on the node type that will run it${allocation_hint:+, for example:}" >&2
+    [ -z "$allocation_hint" ] || echo "  $allocation_hint" >&2
+    exit 2
+fi
+
+[ -n "$node_local_root" ] || fail_storage 'no node-local root is configured; set node_local_root in eb-local.conf (see the README).'
+
 # The scheduler's exact job mount keeps mutable work outside shared quotas.
 [[ "$SLURM_JOB_ID" =~ ^[1-9][0-9]*$ ]] || fail_storage 'invalid Slurm allocation identity.'
 job_user=$(id -un) || fail_storage 'cannot determine the allocation user.'
-job_root="/scratch-node/${job_user}.${SLURM_JOB_ID}"
+job_root="${node_local_root}/${job_user}.${SLURM_JOB_ID}"
 case "$job_root" in
-    /scratch-node/*) ;;
-    *) fail_storage 'node-local root must name the allocation mount below /scratch-node.' ;;
+    "$node_local_root"/*) ;;
+    *) fail_storage "node-local root must name the allocation mount below $node_local_root." ;;
 esac
 [ -d "$job_root" ] && [ ! -L "$job_root" ] && [ -w "$job_root" ] && [ -x "$job_root" ] ||
     fail_storage 'allocation node-local root must be an owned writable directory.'
 canonical_root=$(readlink -e -- "$job_root") || fail_storage 'cannot resolve allocation node-local root.'
 [ "$canonical_root" = "$job_root" ] || fail_storage 'allocation node-local root must be canonical.'
 [ "$(stat -c %u -- "$job_root")" = "$(id -u)" ] || fail_storage 'allocation node-local root belongs to another user.'
-[ "$(findmnt -n -o FSTYPE --target "$job_root")" = xfs ] ||
-    fail_storage 'allocation node-local root must use XFS, not shared or memory-backed storage.'
+[ "$(findmnt -n -o FSTYPE --target "$job_root")" = "$node_local_fstype" ] ||
+    fail_storage "allocation node-local root must use $node_local_fstype, not shared or memory-backed storage."
 [ "$(findmnt -n -o TARGET --target "$job_root")" = "$job_root" ] ||
     fail_storage 'allocation node-local root must be its own mount.'
 mount_options=$(findmnt -n -o OPTIONS --target "$job_root") ||
@@ -111,10 +184,12 @@ case ",$mount_options," in
 esac
 
 prefix=$(readlink -m -- "$prefix") || fail_storage 'cannot resolve installation prefix.'
-case "$prefix" in
-    /scratch-node|/scratch-node/*|/scratch-shared|/scratch-shared/*|/scratch-local|/scratch-local/*|/gpfs/scratch1|/gpfs/scratch1/*)
-        fail_storage 'installation, source and log paths must use durable owned storage.' ;;
-esac
+for refused in "$node_local_root" $shared_scratch; do
+    case "$prefix" in
+        "$refused"|"$refused"/*)
+            fail_storage 'installation, source and log paths must use durable owned storage.' ;;
+    esac
+done
 mkdir -p -- "$prefix"
 [ -w "$prefix" ] && [ -x "$prefix" ] || fail_storage 'installation prefix is not writable.'
 prefix=$(cd "$prefix" && pwd -P)

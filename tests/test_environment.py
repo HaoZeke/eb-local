@@ -97,7 +97,10 @@ class EnvironmentControls(unittest.TestCase):
         self.job = self.nodes / (pwd.getpwuid(os.getuid()).pw_name + ".123")
         self.job.mkdir(parents=True)
         self.script = self.root / "eb-local"
-        self.script.write_text(SCRIPT.read_text().replace("/scratch-node", str(self.nodes)))
+        self.script.write_text(SCRIPT.read_text())
+        self.config = self.root / "site.conf"
+        self.config.write_text(f"node_local_root = {self.nodes}\n")
+        self.config.chmod(0o600)
         (self.root / "doubles.sh").write_text(DOUBLE)
         (self.root / "capture.py").write_text(CAPTURE)
         self.prefix = self.root / "owned space 'quote' $(touch injected)"
@@ -106,7 +109,8 @@ class EnvironmentControls(unittest.TestCase):
                         CONTROL_ROOT=str(self.root), CONTROL_CLEAR=" ".join(CLEAR),
                         CONTROL_PREFIX=str(self.prefix), CONTROL_MODE="EESSI_USER_INSTALL",
                         EB_LOCAL_PREFIX=str(self.prefix), USER="fixture",
-                        SLURM_JOB_ID="123", TMPDIR=str(self.job), CONTROL_JOB_ROOT=str(self.job))
+                        SLURM_JOB_ID="123", TMPDIR=str(self.job), CONTROL_JOB_ROOT=str(self.job),
+                        EB_LOCAL_CONFIG=str(self.config))
         self.env.update({name: "inherited" for name in CLEAR})
 
     def run_wrapper(self, arguments, **extra):

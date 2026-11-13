@@ -40,12 +40,29 @@ eb-local --project /path/to/project/eessi GSL-2.8-GCC-15.2.0.eb --robot
 Build mode requires a numeric Slurm allocation ID. It derives
 the allocation's node-local directory from the actual user identity and
 allocation, then requires that owned, writable, canonical directory to be
-its own XFS mount. An inherited shared or nested `TMPDIR` does not select
+its own mount of the configured file system type (XFS by default). An inherited shared or nested `TMPDIR` does not select
 the build filesystem. Shared parallel-filesystem paths, tmpfs, enclosing mounts and symlink aliases are refused
 before the installation prefix is created. There is no shared-scratch fallback.
 The scheduler owns the lifetime of the job workspace; sources and logs remain
 with the user or project installation. `--help` and `--env` create no directories
 and require no allocation.
+
+## Site configuration
+
+The node-local mount and the shared scratch trees differ per site, so they come from `eb-local.conf`.
+`eb-local` reads the first of `EB_LOCAL_CONFIG`, `eb-local.conf` beside the resolved script, and `/etc/eb-local.conf` that exists.
+The file is parsed, never sourced, and is used only when it is a regular file, not a symlink, not writable by group or others, and owned by root, by the owner of the script, or by the caller.
+Without a configured `node_local_root`, build mode stops before it creates anything; `--help` and `--env` need no configuration.
+
+```ini
+# eb-local.conf
+node_local_root = /local/scratch          # allocation mounts are <root>/<user>.<job id>
+node_local_fstype = xfs                   # file system type the allocation mount must have
+shared_scratch = /scratch /scratch-shared # refused as installation prefix
+allocation_hint = salloc -p <partition> -n 16 -t 02:00:00
+```
+
+The node-local root is refused as an installation prefix too. A site's easyconfig installs the file next to the script.
 
 Everything after the options goes to `eb` unchanged, and `eb-local` exits with `eb`'s status.
 

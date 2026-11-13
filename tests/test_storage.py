@@ -60,6 +60,18 @@ if sys.argv[1]=="eb":sys.exit(int(os.environ.get("CONTROL_EB_STATUS","0")))
 '''
 
 
+def write_config(path, nodes, extra=""):
+    """A site configuration naming NODES as the node-local root, owned by the caller."""
+    path.write_text(
+        "# test site\n"
+        f"node_local_root = {nodes}\n"
+        "node_local_fstype = xfs\n"
+        f"shared_scratch = /scratch-shared /scratch-local {nodes.parent / 'shared'}\n"
+        "allocation_hint = salloc -n 16 -t 02:00:00\n" + extra
+    )
+    path.chmod(0o600)
+
+
 class StorageControls(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="eb-local-storage-")
@@ -71,16 +83,18 @@ class StorageControls(unittest.TestCase):
         self.prefix = self.root / "durable" / "owned prefix"
         self.script = self.root / "eb-local"
         original = SCRIPT.read_text()
-        self.assertIn("/scratch-node/*)", original)
-        # Substitute only the fixed mount namespace; directory and identity probes remain real.
-        self.script.write_text(original.replace("/scratch-node", str(self.nodes)))
+        self.assertNotIn("/scratch-node", original)
+        self.script.write_text(original)
+        # The site configuration names the mount namespace; probes remain real.
+        self.config = self.root / "site.conf"
+        write_config(self.config, self.nodes)
         (self.root / "doubles.sh").write_text(DOUBLE)
         (self.root / "capture.py").write_text(CAPTURE)
         self.env = dict(os.environ, BASH_ENV=str(self.root / "doubles.sh"),
                         CONTROL_ROOT=str(self.root), CONTROL_JOB_ROOT=str(self.job),
                         CONTROL_PATH_NAMES=" ".join(MUTABLE + DURABLE),
                         EB_LOCAL_PREFIX=str(self.prefix), SLURM_JOB_ID="123",
-                        TMPDIR=str(self.job))
+                        TMPDIR=str(self.job), EB_LOCAL_CONFIG=str(self.config))
         for name in ("EESSI_USER_INSTALL", "EESSI_PROJECT_INSTALL",
                      "EESSI_SITE_INSTALL", "EESSI_CVMFS_INSTALL"):
             self.env.pop(name, None)
@@ -189,6 +203,44 @@ class StorageControls(unittest.TestCase):
         self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
         self.assertFalse((self.root / "load.json").exists())
         self.assertEqual(list(self.job.iterdir()), [])
+
+    def test_missing_configuration_refuses_before_any_write(self):
+        self.config.unlink()
+        self.refused()
+
+    def test_configuration_without_node_local_root_is_refused(self):
+        self.config.write_text("node_local_fstype = xfs\n")
+        self.refused()
+
+    def test_group_writable_configuration_is_refused(self):
+        self.config.chmod(0o620)
+        self.refused()
+
+    def test_symlinked_configuration_is_refused(self):
+        real = self.root / "real.conf"
+        self.config.rename(real)
+        self.config.symlink_to(real)
+        self.refused()
+
+    def test_unknown_setting_is_refused(self):
+        write_config(self.config, self.nodes, "source_me = $(touch injected)\n")
+        self.refused()
+        self.assertFalse((self.root / "injected").exists())
+
+    def test_configured_shared_scratch_is_refused_as_prefix(self):
+        destination = self.root / "shared" / "install"
+        run = self.run_wrapper(EB_LOCAL_PREFIX=str(destination))
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertFalse(destination.exists())
+
+    def test_configured_fstype_is_enforced(self):
+        write_config(self.config, self.nodes, "node_local_fstype = ext4\n")
+        self.refused()
+
+    def test_allocation_hint_comes_from_the_configuration(self):
+        run = self.run_wrapper(SLURM_JOB_ID="")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("salloc -n 16 -t 02:00:00", run.stderr)
 
     def test_install_prefix_cannot_use_job_storage(self):
         destination = self.job / "install"
