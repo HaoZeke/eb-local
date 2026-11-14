@@ -33,4 +33,5 @@ jobs:
           zig build --release=safe --prefix out
           ! grep -aq EB_LOCAL_TEST_MOUNTINFO out/bin/eb-local
           ! grep -aq EB_LOCAL_TEST_UID out/bin/eb-local
+          ! grep -aq EB_LOCAL_TEST_SELF_OWNER out/bin/eb-local
           out/bin/eb-local --version

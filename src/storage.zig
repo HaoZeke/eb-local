@@ -70,35 +70,32 @@ pub fn mountOf(a: Allocator, mountinfo: []const u8, path: []const u8) Allocator.
     return best;
 }
 
-/// `path` made absolute and normal: the deepest part that exists is
-/// resolved through symbolic links, the rest is joined on with . and ..
-/// applied, as `readlink -m` does.
+/// `path` made absolute and normal as `readlink -m` does: each component
+/// that exists is resolved through symbolic links before the next is
+/// applied, so `link/..` is the parent of the link's target; the components
+/// after the first that does not exist are joined on with . and .. applied.
 pub fn canonical(a: Allocator, path: []const u8, cwd: []const u8) Allocator.Error![]const u8 {
     const abs = if (path.len > 0 and path[0] == '/') path else try std.fs.path.join(a, &.{ cwd, path });
-    var parts: std.ArrayList([]const u8) = .empty;
+    var current: []const u8 = "/";
+    var exists_so_far = true;
     var it = std.mem.tokenizeScalar(u8, abs, '/');
-    while (it.next()) |p| {
-        if (std.mem.eql(u8, p, ".")) continue;
-        if (std.mem.eql(u8, p, "..")) {
-            _ = parts.pop();
+    while (it.next()) |part| {
+        if (std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            current = std.fs.path.dirname(current) orelse "/";
             continue;
         }
-        try parts.append(a, p);
+        const next = if (std.mem.eql(u8, current, "/")) try std.mem.concat(a, u8, &.{ "/", part }) else try std.mem.concat(a, u8, &.{ current, "/", part });
+        if (exists_so_far) {
+            var buf: [sys.path_max]u8 = undefined;
+            if (fsx.realpath(fsx.cwd, next, &buf)) |real| {
+                current = try a.dupe(u8, real);
+                continue;
+            } else |_| exists_so_far = false;
+        }
+        current = next;
     }
-    // The longest existing prefix, resolved.
-    var k: usize = parts.items.len;
-    while (true) : (k -= 1) {
-        const prefix = try std.mem.concat(a, u8, &.{ "/", try std.mem.join(a, "/", parts.items[0..k]) });
-        var buf: [sys.path_max]u8 = undefined;
-        if (fsx.realpath(fsx.cwd, prefix, &buf)) |real| {
-            const rest = parts.items[k..];
-            if (rest.len == 0) return try a.dupe(u8, real);
-            const tail = try std.mem.join(a, "/", rest);
-            return if (std.mem.eql(u8, real, "/")) try std.mem.concat(a, u8, &.{ "/", tail }) else try std.mem.concat(a, u8, &.{ real, "/", tail });
-        } else |_| {}
-        if (k == 0) break;
-    }
-    return std.mem.concat(a, u8, &.{ "/", try std.mem.join(a, "/", parts.items) });
+    return current;
 }
 
 pub fn under(path: []const u8, root: []const u8) bool {
@@ -212,6 +209,16 @@ test "canonical paths" {
     const a = arena.allocator();
     try testing.expectEqualStrings("/no/such/place", try canonical(a, "/no/such/./x/../place", "/"));
     try testing.expectEqualStrings("/tmp/a/b", try canonical(a, "a/b", "/tmp"));
+    // link/.. is the parent of the link's target, as readlink -m has it.
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const root = try std.fmt.allocPrint(a, "{s}/.zig-cache/canonical-test-{d}", .{ cwd, linux.getpid() });
+    try common.atomic.makedirs(try std.fmt.allocPrint(a, "{s}/deep/target", .{root}));
+    defer fsx.deleteTree(a, fsx.cwd, root) catch {};
+    var zt: [sys.path_max:0]u8 = undefined;
+    var zl: [sys.path_max:0]u8 = undefined;
+    _ = linux.symlinkat((try sys.z(&zt, try std.fmt.allocPrint(a, "{s}/deep/target", .{root}))).ptr, linux.AT.FDCWD, (try sys.z(&zl, try std.fmt.allocPrint(a, "{s}/lnk", .{root}))).ptr);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/deep/eessi", .{root}), try canonical(a, try std.fmt.allocPrint(a, "{s}/lnk/../eessi", .{root}), "/"));
     try testing.expect(under("/a/b", "/a"));
     try testing.expect(under("/a", "/a"));
     try testing.expect(!under("/ab", "/a"));

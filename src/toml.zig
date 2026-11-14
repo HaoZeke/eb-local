@@ -56,12 +56,24 @@ pub const Diagnostic = struct {
 
 pub const Error = error{Invalid} || Allocator.Error;
 
+/// Deepest nesting of arrays, and most keys and array items, accepted.
+pub const max_depth = 32;
+pub const max_entries = 10_000;
+
 const Parser = struct {
     a: Allocator,
     src: []const u8,
     pos: usize = 0,
     line: usize = 1,
     diag: *Diagnostic,
+    depth: usize = 0,
+    entries: usize = 0,
+
+    /// A configuration file has no use for more; a bigger one is a mistake.
+    fn count(p: *Parser) Error!void {
+        p.entries += 1;
+        if (p.entries > max_entries) return p.fail("more than {d} keys and array items", .{max_entries});
+    }
 
     fn fail(p: *Parser, comptime fmt: []const u8, args: anytype) Error {
         p.diag.* = .{ .line = p.line, .message = try std.fmt.allocPrint(p.a, fmt, args) };
@@ -252,6 +264,9 @@ const Parser = struct {
 
     fn array(p: *Parser) Error!Value {
         p.pos += 1; // [
+        p.depth += 1;
+        defer p.depth -= 1;
+        if (p.depth > max_depth) return p.fail("arrays are nested more than {d} deep", .{max_depth});
         var items: std.ArrayList(Value) = .empty;
         while (true) {
             p.skipWhitespaceAndNewlines();
@@ -260,6 +275,7 @@ const Parser = struct {
                 return .{ .array = items.items };
             }
             try items.append(p.a, try p.value());
+            try p.count();
             p.skipWhitespaceAndNewlines();
             const c = p.peek() orelse return p.fail("an array is not closed", .{});
             if (c == ',') {
@@ -338,6 +354,7 @@ const Parser = struct {
         if (parent.get(last)) |e|
             return p.fail("'{s}' is set twice (first on line {d})", .{ joined(p.a, path), e.line });
         try parent.entries.append(p.a, .{ .key = last, .value = v, .line = line });
+        try p.count();
         p.line = after;
         try p.endOfLine();
     }
@@ -448,6 +465,7 @@ test "every refusal names its line" {
     try expectInvalid("x = \"\"\"a\"\"\"\n", 1, "multi-line");
     try expectInvalid("x = \"a\x01\"\n", 1, "control character");
     try expectInvalid("x = 1\x00\n", 1, "NUL");
+    try expectInvalid("x = [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\n", 1, "nested");
 }
 
 test "an empty file and a file of comments are empty tables" {

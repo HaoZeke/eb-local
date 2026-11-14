@@ -120,53 +120,101 @@ pub fn placeholder(a: Allocator, name: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(a, "<secret {s} removed by eb-local>", .{name});
 }
 
-/// Replace every value in `bytes`; null when none occurs.
+/// The forms a value takes in a log: as it is, base64 (an HTTP basic
+/// authorization header) and percent-encoded (a URL).
+fn variants(a: Allocator, value: []const u8) Allocator.Error![3][]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const b64 = try a.alloc(u8, enc.calcSize(value.len));
+    _ = enc.encode(b64, value);
+    var url: std.ArrayList(u8) = .empty;
+    for (value) |c| {
+        if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-._~", c) != null) {
+            try url.append(a, c);
+        } else {
+            try url.appendSlice(a, try std.fmt.allocPrint(a, "%{X:0>2}", .{c}));
+        }
+    }
+    return .{ value, b64, url.items };
+}
+
+/// Shorter values would match ordinary text everywhere; they are not
+/// redacted, and a build that has one is told so.
+pub const min_redacted_len = 4;
+
+/// Replace every value, in each of its forms, in `bytes`; null when none occurs.
 pub fn redactText(a: Allocator, bytes: []const u8, values: []const Resolved) Allocator.Error!?[]u8 {
     var current: []const u8 = bytes;
     var changed = false;
     for (values) |v| {
-        // A value shorter than 4 bytes would match ordinary text everywhere.
-        if (v.value.len < 4) continue;
-        if (std.mem.indexOf(u8, current, v.value) == null) continue;
-        current = try std.mem.replaceOwned(u8, a, current, v.value, try placeholder(a, v.name));
-        changed = true;
+        if (v.value.len < min_redacted_len) continue;
+        for (try variants(a, v.value)) |form| {
+            if (form.len < min_redacted_len or std.mem.indexOf(u8, current, form) == null) continue;
+            current = try std.mem.replaceOwned(u8, a, current, form, try placeholder(a, v.name));
+            changed = true;
+        }
     }
     return if (changed) @constCast(current) else null;
 }
 
 /// Largest log rewritten; a larger one is reported, not rewritten.
 pub const log_limit: usize = 1 << 30;
+/// Deepest directory searched; anything deeper is reported.
+pub const max_depth = 16;
 
 pub const RedactReport = struct {
     files: usize = 0,
     too_large: std.ArrayList([]const u8) = .empty,
+    too_deep: std.ArrayList([]const u8) = .empty,
 };
 
-/// Redact regular files below `dir` (not following symbolic links, at most
-/// four levels down) modified at or after `since` (seconds).
-pub fn redactTree(a: Allocator, dir_path: []const u8, since: i64, values: []const Resolved, report: *RedactReport) (fsx.Error || Allocator.Error)!void {
+pub const Filter = enum {
+    /// Every regular file.
+    all,
+    /// Only files in a directory named "easybuild": the logs and recipes an
+    /// installation keeps, not the installed software itself.
+    easybuild_dirs,
+};
+
+/// Redact regular files below `dir` (never through a symbolic link)
+/// modified at or after `since` (seconds).
+pub fn redactTree(a: Allocator, dir_path: []const u8, since: i64, values: []const Resolved, filter: Filter, report: *RedactReport) (fsx.Error || Allocator.Error)!void {
     if (values.len == 0) return;
     const dir = fsx.openDir(fsx.cwd, dir_path, false) catch |e| switch (e) {
         error.NotFound => return,
         else => return e,
     };
     defer sys.close(dir);
-    try redactDir(a, dir, dir_path, since, values, report, 0);
+    try redactDir(a, dir, dir_path, since, values, filter, report, 0);
 }
 
-fn redactDir(a: Allocator, dir: sys.fd_t, path: []const u8, since: i64, values: []const Resolved, report: *RedactReport, depth: usize) (fsx.Error || Allocator.Error)!void {
+fn redactDir(a: Allocator, dir: sys.fd_t, path: []const u8, since: i64, values: []const Resolved, filter: Filter, report: *RedactReport, depth: usize) (fsx.Error || Allocator.Error)!void {
+    const in_easybuild = std.mem.eql(u8, std.fs.path.basename(path), "easybuild");
+    if (filter == .easybuild_dirs and !in_easybuild) {
+        // An installation's root holds easybuild/; only that is searched,
+        // not the installed software beside it.
+        const is_root = if (fsx.statAt(dir, "easybuild", false)) |st| st.isDir() else |_| false;
+        if (is_root) {
+            const sub = fsx.openDir(dir, "easybuild", false) catch return;
+            defer sys.close(sub);
+            return redactDir(a, sub, try std.fs.path.join(a, &.{ path, "easybuild" }), since, values, filter, report, depth + 1);
+        }
+    }
     var it = try fsx.DirIter.init(a, dir);
     while (try it.next()) |e| {
         const st = fsx.statAt(dir, e.name, false) catch continue;
         const child = try std.fs.path.join(a, &.{ path, e.name });
         if (st.isDir()) {
-            if (depth >= 4) continue;
+            if (depth >= max_depth) {
+                if (filter == .all) try report.too_deep.append(a, child);
+                continue;
+            }
             const sub = fsx.openDir(dir, e.name, false) catch continue;
             defer sys.close(sub);
-            try redactDir(a, sub, child, since, values, report, depth + 1);
+            try redactDir(a, sub, child, since, values, filter, report, depth + 1);
             continue;
         }
         if (!st.isReg() or st.mtime.sec < since) continue;
+        if (filter == .easybuild_dirs and !in_easybuild) continue;
         if (st.size > log_limit) {
             try report.too_large.append(a, child);
             continue;
@@ -288,7 +336,7 @@ test "logs written during the build are redacted" {
     _ = try s.write("logs/clean.log", "nothing here\n", 0o644);
     const values = [_]Resolved{ .{ .name = "TOKEN", .value = "s3cret-value" }, .{ .name = "SHORT", .value = "ab" } };
     var report: RedactReport = .{};
-    try redactTree(a, try std.fs.path.join(a, &.{ s.root, "logs" }), 0, &values, &report);
+    try redactTree(a, try std.fs.path.join(a, &.{ s.root, "logs" }), 0, &values, .all, &report);
     try testing.expectEqual(@as(usize, 1), report.files);
     const opened = try fsx.openRegular(fsx.cwd, log, false);
     defer sys.close(opened.fd);
@@ -296,4 +344,17 @@ test "logs written during the build are redacted" {
     try testing.expect(std.mem.indexOf(u8, text, "s3cret-value") == null);
     try testing.expect(std.mem.indexOf(u8, text, "<secret TOKEN removed by eb-local>") != null);
     try testing.expectEqual(@as(u32, 0o640), opened.stat.perm());
+}
+
+test "a value is removed as it is, in base64 and percent-encoded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const values = [_]Resolved{.{ .name = "T", .value = "p@ss word/1" }};
+    const text = "raw p@ss word/1 b64 cEBzcyB3b3JkLzE= url p%40ss%20word%2F1 end";
+    const clean = (try redactText(a, text, &values)).?;
+    try testing.expect(std.mem.indexOf(u8, clean, "p@ss") == null);
+    try testing.expect(std.mem.indexOf(u8, clean, "cEBzcyB3b3JkLzE=") == null);
+    try testing.expect(std.mem.indexOf(u8, clean, "p%40ss") == null);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, clean, "<secret T removed by eb-local>"));
 }

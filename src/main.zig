@@ -16,7 +16,7 @@ pub const storage = @import("storage.zig");
 const Allocator = std.mem.Allocator;
 
 const tool = "eb-local";
-pub const version = "2.1.0";
+pub const version = "2.1.1";
 
 const usage_text =
     \\eb-local: install and build software on top of EESSI 2026.06, into a
@@ -176,7 +176,14 @@ fn selfDir(a: Allocator) []const u8 {
     return a.dupe(u8, std.fs.path.dirname(exe) orelse "/") catch oom();
 }
 
+/// Set in main from EB_LOCAL_TEST_SELF_OWNER, only in the test artifact,
+/// so a test can make this program look installed by another account.
+var test_self_owner: ?linux.uid_t = null;
+
 fn selfOwner() linux.uid_t {
+    if (comptime build_options.test_ops) {
+        if (test_self_owner) |u| return u;
+    }
     var buf: [sys.path_max]u8 = undefined;
     const exe = selfExe(&buf) orelse return 0;
     const st = fsx.statAt(fsx.cwd, exe, true) catch return 0;
@@ -190,19 +197,40 @@ const Trust = enum { site, user };
 /// program's owner or the caller (a site file) or by the caller (a user
 /// file). A file that fails is an error, never skipped.
 fn readTrusted(c: Ctx, path: []const u8, kind: Trust) []const u8 {
+    const opened = openConfig(path);
+    defer sys.close(opened.fd);
+    const uid = opened.stat.uid;
+    const ok = switch (kind) {
+        .site => uid == 0 or uid == selfOwner(),
+        .user => uid == linux.getuid(),
+    };
+    if (!ok) die("{s} is owned by uid {d} and is not used", .{ path, uid });
+    return fsx.readAll(c.a, opened.fd, 1 << 20) catch |e| die("cannot read {s} ({s})", .{ path, @errorName(e) });
+}
+
+const Opened = struct { fd: sys.fd_t, stat: fsx.Stat };
+
+/// A configuration file: a regular file, not a symbolic link, not writable
+/// by group or others. A file that fails is an error, never skipped.
+fn openConfig(path: []const u8) Opened {
     const lst = fsx.statAt(fsx.cwd, path, false) catch |e| die("cannot open {s} ({s})", .{ path, @errorName(e) });
     if (lst.isLink()) die("{s} is a symbolic link; a configuration file must be a regular file", .{path});
     const opened = fsx.openRegular(fsx.cwd, path, false) catch |e| die("cannot open {s} ({s})", .{ path, @errorName(e) });
+    if (opened.stat.mode & 0o022 != 0) die("{s} is writable by group or others and is not used; chmod go-w it", .{path});
+    return .{ .fd = opened.fd, .stat = opened.stat };
+}
+
+/// The layer a file named with --config or EB_LOCAL_CONFIG belongs to: a
+/// site file when root or this program's owner owns it, a user file when
+/// the caller does. Only a site file may set [storage], so a user cannot
+/// point builds at a shared file system by naming a file of their own.
+fn explicitTrust(path: []const u8) Trust {
+    const opened = openConfig(path);
     defer sys.close(opened.fd);
-    const st = opened.stat;
-    if (st.mode & 0o022 != 0) die("{s} is writable by group or others and is not used; chmod go-w it", .{path});
-    const uid = linux.getuid();
-    const ok = switch (kind) {
-        .site => st.uid == 0 or st.uid == selfOwner() or st.uid == uid,
-        .user => st.uid == uid,
-    };
-    if (!ok) die("{s} is owned by uid {d} and is not used", .{ path, st.uid });
-    return fsx.readAll(c.a, opened.fd, 1 << 20) catch |e| die("cannot read {s} ({s})", .{ path, @errorName(e) });
+    const uid = opened.stat.uid;
+    if (uid == 0 or uid == selfOwner()) return .site;
+    if (uid == linux.getuid()) return .user;
+    die("{s} is owned by uid {d} and is not used", .{ path, uid });
 }
 
 fn exists(path: []const u8) bool {
@@ -237,30 +265,39 @@ fn nonEmpty(v: ?[]const u8) ?[]const u8 {
 /// The configuration files in force, site first.
 fn configSources(c: Ctx, g: Global) []const config.Source {
     var sources: std.ArrayList(config.Source) = .empty;
-    if (g.config_file orelse nonEmpty(c.env.get("EB_LOCAL_CONFIG"))) |path| {
-        // As in 1.x: the named file is the site configuration.
+    const explicit = g.config_file orelse nonEmpty(c.env.get("EB_LOCAL_CONFIG"));
+    const explicit_trust: ?Trust = if (explicit) |path| blk: {
         if (!exists(path)) die("the configuration file {s} does not exist", .{path});
-        sources.append(c.a, sourceFrom(c, path, .site)) catch oom();
-        return sources.items;
+        break :blk explicitTrust(path);
+    } else null;
+    // The site file: a named one the site owns replaces the installed one.
+    if (explicit_trust == .site) {
+        sources.append(c.a, sourceFrom(c, explicit.?, .site)) catch oom();
+    } else {
+        const dir = selfDir(c.a);
+        const candidates = [_][]const u8{
+            std.fs.path.join(c.a, &.{ dir, "config.toml" }) catch oom(),
+            "/etc/eb-local/config.toml",
+            std.fs.path.join(c.a, &.{ dir, "eb-local.conf" }) catch oom(),
+            "/etc/eb-local.conf",
+        };
+        for (candidates) |p| if (exists(p)) {
+            sources.append(c.a, sourceFrom(c, p, .site)) catch oom();
+            break;
+        };
     }
-    const dir = selfDir(c.a);
-    const candidates = [_][]const u8{
-        std.fs.path.join(c.a, &.{ dir, "config.toml" }) catch oom(),
-        "/etc/eb-local/config.toml",
-        std.fs.path.join(c.a, &.{ dir, "eb-local.conf" }) catch oom(),
-        "/etc/eb-local.conf",
-    };
-    for (candidates) |p| if (exists(p)) {
-        sources.append(c.a, sourceFrom(c, p, .site)) catch oom();
-        break;
-    };
-    const user_file: ?[]const u8 = if (nonEmpty(c.env.get("XDG_CONFIG_HOME"))) |x|
-        std.fs.path.join(c.a, &.{ x, "eb-local", "config.toml" }) catch oom()
-    else if (nonEmpty(c.env.get("HOME"))) |h|
-        std.fs.path.join(c.a, &.{ h, ".config", "eb-local", "config.toml" }) catch oom()
-    else
-        null;
-    if (user_file) |p| if (exists(p)) sources.append(c.a, sourceFrom(c, p, .user)) catch oom();
+    // The user file: a named one the caller owns replaces the usual one.
+    if (explicit_trust == .user) {
+        sources.append(c.a, sourceFrom(c, explicit.?, .user)) catch oom();
+    } else if (explicit_trust == null) {
+        const user_file: ?[]const u8 = if (nonEmpty(c.env.get("XDG_CONFIG_HOME"))) |x|
+            std.fs.path.join(c.a, &.{ x, "eb-local", "config.toml" }) catch oom()
+        else if (nonEmpty(c.env.get("HOME"))) |h|
+            std.fs.path.join(c.a, &.{ h, ".config", "eb-local", "config.toml" }) catch oom()
+        else
+            null;
+        if (user_file) |p| if (exists(p)) sources.append(c.a, sourceFrom(c, p, .user)) catch oom();
+    }
     return sources.items;
 }
 
@@ -278,7 +315,8 @@ fn place(c: Ctx, s: config.Settings) Place {
         const st = fsx.statAt(fsx.cwd, p, true) catch {
             cli.err("eb-local: project directory {s} does not exist.\n", .{p});
             cli.err("  The project owner creates it once, with the project group and g+s:\n", .{});
-            cli.err("  mkdir -p {s} && chgrp <group> {s} && chmod 2770 {s}\n", .{ p, p, p });
+            const qp = q(c.a, p);
+            cli.err("  mkdir -p {s} && chgrp <group> {s} && chmod 2770 {s}\n", .{ qp, qp, qp });
             std.process.exit(2);
         };
         if (!st.isDir()) die("project directory {s} is not a directory", .{p});
@@ -403,7 +441,6 @@ fn runAttached(a: Allocator, argv: []const []const u8, envp: proc.Envp) u8 {
     const zargv = a.allocSentinel(?[*:0]const u8, argv.len, null) catch oom();
     for (argv, 0..) |x, i| zargv[i] = (a.dupeSentinel(u8, x, 0) catch oom()).ptr;
     const ign: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
-    const dfl: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
     const sigs = [_]linux.SIG{ .INT, .TERM, .HUP, .QUIT };
     var old: [sigs.len]linux.Sigaction = undefined;
     for (sigs, 0..) |sg, i| _ = linux.sigaction(sg, &ign, &old[i]);
@@ -413,7 +450,9 @@ fn runAttached(a: Allocator, argv: []const []const u8, envp: proc.Envp) u8 {
     const pid: isize = @bitCast(linux.fork());
     if (pid < 0) die("cannot start {s}", .{argv[0]});
     if (pid == 0) {
-        for (sigs) |sg| _ = linux.sigaction(sg, &dfl, null);
+        // The dispositions this process had, so nohup and an ignored SIGINT
+        // reach the child as they would have without eb-local.
+        for (sigs, 0..) |sg, i| _ = linux.sigaction(sg, &old[i], null);
         const rc = linux.execve(zargv[0].?, zargv.ptr, envp);
         cli.err("eb-local: cannot run {s} ({s})\n", .{ argv[0], sys.describeErrno(linux.errno(rc)) });
         linux.exit_group(127);
@@ -605,9 +644,14 @@ fn cmdClean(c: Ctx, s: config.Settings, o: CleanOpts) u8 {
         say("eb-local: dry run, nothing removed ({d} file(s), {d} workspace(s))", .{ targets.len, spaces.items.len });
         return 0;
     }
+    if (targets.len > 0 and trash != .rtrash and !o.delete) {
+        warn("rtrash is not installed; nothing removed. Install rtrash, or pass --delete to delete for good.", .{});
+        return 1;
+    }
     // Build workspaces are node-local scratch the scheduler removes anyway;
     // they are deleted, not trashed.
     for (spaces.items) |w| fsx.deleteTree(a, fsx.cwd, w) catch |e| warn("cannot remove {s} ({s})", .{ w, @errorName(e) });
+    if (spaces.items.len > 0) say("eb-local: removed {d} build workspace(s)", .{spaces.items.len});
     if (targets.len > 0) {
         if (trash == .rtrash) {
             var argv: std.ArrayList([]const u8) = .empty;
@@ -616,12 +660,9 @@ fn cmdClean(c: Ctx, s: config.Settings, o: CleanOpts) u8 {
             const rc = runAttached(a, argv.items, c.envp);
             if (rc != 0) die("rtrash put exited {d}", .{rc});
             say("eb-local: moved {d} file(s) to the trash (rtrash list, rtrash restore)", .{targets.len});
-        } else if (o.delete) {
+        } else {
             for (targets) |t| sys.unlinkat(fsx.cwd, t, 0) catch |e| warn("cannot remove {s} ({s})", .{ t, @errorName(e) });
             say("eb-local: deleted {d} file(s)", .{targets.len});
-        } else {
-            warn("rtrash is not installed; nothing deleted. Install rtrash, or pass --delete to delete for good.", .{});
-            return 1;
         }
         for ([_][]const u8{ d.logs, d.sources }) |dir| removeEmptyDirs(c, dir, 0);
     }
@@ -677,9 +718,17 @@ fn cmdBuild(c: Ctx, s: config.Settings, args: []const []const u8) u8 {
     }
     const job_root = checkedJobRoot(c, s);
     var p = place(c, s);
-    for (s.shared_scratch.value) |refused| if (storage.under(p.prefix, refused))
+    // The refused trees as the kernel resolves them, so an alias (a symbolic
+    // link to shared scratch) is refused as the tree itself is.
+    var refused: std.ArrayList([]const u8) = .empty;
+    for (s.shared_scratch.value) |r| {
+        refused.append(a, r) catch oom();
+        refused.append(a, storage.canonical(a, r, c.cwd) catch oom()) catch oom();
+    }
+    refused.append(a, s.node_local_root.value) catch oom();
+    refused.append(a, storage.canonical(a, s.node_local_root.value, c.cwd) catch oom()) catch oom();
+    for (refused.items) |r| if (storage.under(p.prefix, r))
         die("installation, source and log paths must use durable owned storage.", .{});
-    if (storage.under(p.prefix, s.node_local_root.value)) die("installation, source and log paths must use durable owned storage.", .{});
     common.atomic.makedirs(p.prefix) catch die("installation prefix is not writable.", .{});
     {
         var zb: [sys.path_max:0]u8 = undefined;
@@ -690,19 +739,36 @@ fn cmdBuild(c: Ctx, s: config.Settings, args: []const []const u8) u8 {
         p.prefix = a.dupe(u8, fsx.realpath(fsx.cwd, p.prefix, &buf) catch die("cannot resolve installation prefix.", .{})) catch oom();
     }
     const d = durableDirs(c, p.prefix);
+    // The trees a build writes below the prefix must not lead onto refused
+    // storage either, through a symbolic link made later.
+    for ([_][]const u8{ "versions", ".eb-local" }) |sub| {
+        const resolved = storage.canonical(a, std.fs.path.join(a, &.{ p.prefix, sub }) catch oom(), c.cwd) catch oom();
+        for (refused.items) |r| if (storage.under(resolved, r))
+            die("{s}/{s} leads onto shared or node-local storage; installation, source and log paths must use durable owned storage.", .{ p.prefix, sub });
+    }
 
-    // Secrets before anything is made, so a missing one leaves nothing behind.
+    // Secrets before the workspace and the build, so a missing one stops
+    // the build with nothing but the installation directory made.
     var failure: secrets.Failure = .{};
     const values = secrets.resolve(a, s.secrets.items, c.env, c.envp, &failure) catch |e| switch (e) {
         error.Unavailable => die("{s}", .{failure.message}),
         error.OutOfMemory => oom(),
     };
+    for (values) |v| if (v.value.len < secrets.min_redacted_len)
+        warn("secret {s} is shorter than {d} bytes and is not removed from logs", .{ v.name, secrets.min_redacted_len });
 
     const work = storage.makeWorkspace(a, job_root) catch die("cannot create allocation workspace.", .{});
     for ([_][]const u8{ "build", "tmp", "cache", "cargo", "source-index" }) |sub|
         common.atomic.makedirs(std.fs.path.join(a, &.{ work, sub }) catch oom()) catch die("cannot create allocation workspace.", .{});
     common.atomic.makedirs(d.sources) catch die("cannot create {s}", .{d.sources});
     common.atomic.makedirs(d.logs) catch die("cannot create {s}", .{d.logs});
+    if (values.len > 0) {
+        // Logs may hold a secret until they are cleaned after the build.
+        var zb: [sys.path_max:0]u8 = undefined;
+        const zl = sys.z(&zb, d.logs) catch die("cannot use {s}", .{d.logs});
+        if (linux.errno(linux.fchmodat(linux.AT.FDCWD, zl.ptr, 0o700)) != .SUCCESS)
+            die("cannot make {s} private before a build with secrets", .{d.logs});
+    }
     const started: i64 = nowSecs();
 
     var env = c.env.clone(a) catch oom();
@@ -735,7 +801,11 @@ fn cmdBuild(c: Ctx, s: config.Settings, args: []const []const u8) u8 {
 
     if (values.len > 0) {
         var report: secrets.RedactReport = .{};
-        secrets.redactTree(a, d.logs, started, values, &report) catch |e| warn("cannot check the logs for secrets ({s})", .{@errorName(e)});
+        secrets.redactTree(a, d.logs, started, values, .all, &report) catch |e| warn("cannot check the logs for secrets ({s})", .{@errorName(e)});
+        // EasyBuild keeps a copy of its log in each installation's easybuild/.
+        const versions = std.fs.path.join(a, &.{ p.prefix, "versions" }) catch oom();
+        secrets.redactTree(a, versions, started, values, .easybuild_dirs, &report) catch |e| warn("cannot check the installation logs for secrets ({s})", .{@errorName(e)});
+        for (report.too_deep.items) |f| warn("{s} is too deep to check for secret values; inspect it before sharing", .{f});
         if (report.files > 0) say("eb-local: removed secret values from {d} log file(s)", .{report.files});
         for (report.too_large.items) |f| warn("{s} is too large to check for secret values; inspect it before sharing", .{f});
     }
@@ -768,23 +838,35 @@ const Found = struct {
     modules: std.ArrayList([]const u8) = .empty,
 };
 
-/// Below `path`, never through a symbolic link: every software/NAME/VERSION
-/// directory and modules/all/NAME/VERSION.lua file, for every CPU target.
+fn isDirAt(dir: sys.fd_t, name: []const u8) bool {
+    const st = fsx.statAt(dir, name, false) catch return false;
+    return st.isDir();
+}
+
+/// The path names itself: no component is a symbolic link.
+fn literalPath(c: Ctx, path: []const u8) bool {
+    var buf: [sys.path_max]u8 = undefined;
+    const real = fsx.realpath(fsx.cwd, path, &buf) catch return false;
+    _ = c;
+    return std.mem.eql(u8, real, path);
+}
+
+/// Below `path`, never through a symbolic link, the target roots (a
+/// directory holding both software/ and modules/, one per CPU target as
+/// EESSI-extend lays them out), and in each, software/NAME/VERSION and
+/// modules/all/NAME/VERSION.lua. Installed software is never searched.
 fn findInstalls(c: Ctx, path: []const u8, name: []const u8, ver: []const u8, found: *Found, depth: usize) void {
     if (depth > 12) return;
     const fd = fsx.openDir(fsx.cwd, path, false) catch return;
     defer sys.close(fd);
-    const base = std.fs.path.basename(path);
-    if (std.mem.eql(u8, base, "software")) {
-        const dir = std.fs.path.join(c.a, &.{ path, name, ver }) catch oom();
+    if (isDirAt(fd, "software") and isDirAt(fd, "modules")) {
+        const dir = std.fs.path.join(c.a, &.{ path, "software", name, ver }) catch oom();
         if (fsx.statAt(fsx.cwd, dir, false)) |st| {
-            if (st.isDir()) found.installs.append(c.a, dir) catch oom();
+            if (st.isDir() and literalPath(c, dir)) found.installs.append(c.a, dir) catch oom();
         } else |_| {}
-    }
-    if (std.mem.eql(u8, base, "all") and std.mem.eql(u8, std.fs.path.basename(std.fs.path.dirname(path) orelse ""), "modules")) {
-        const file = std.fs.path.join(c.a, &.{ path, name, str(c.a, "{s}.lua", .{ver}) }) catch oom();
+        const file = std.fs.path.join(c.a, &.{ path, "modules", "all", name, str(c.a, "{s}.lua", .{ver}) }) catch oom();
         if (fsx.statAt(fsx.cwd, file, false)) |st| {
-            if (st.isReg()) found.modules.append(c.a, file) catch oom();
+            if (st.isReg() and literalPath(c, file)) found.modules.append(c.a, file) catch oom();
         } else |_| {}
         return;
     }
@@ -792,8 +874,6 @@ fn findInstalls(c: Ctx, path: []const u8, name: []const u8, ver: []const u8, fou
     while (it.next() catch null) |e| {
         const st = fsx.statAt(fd, e.name, false) catch continue;
         if (!st.isDir()) continue;
-        // The installs themselves are not searched for more installs.
-        if (std.mem.eql(u8, base, "software") and std.mem.eql(u8, e.name, name)) continue;
         findInstalls(c, std.fs.path.join(c.a, &.{ path, e.name }) catch oom(), name, ver, found, depth + 1);
     }
 }
@@ -819,7 +899,7 @@ fn cmdUninstall(c: Ctx, s: config.Settings, modules: []const []const u8, o: Unin
     const p = place(c, s);
     const versions = std.fs.path.join(a, &.{ p.prefix, "versions" }) catch oom();
     if (fsx.statAt(fsx.cwd, versions, false)) |st| {
-        if (st.isLink()) die("{s} is a symbolic link; uninstall leaves it alone.", .{versions});
+        if (st.isLink() or !literalPath(c, versions)) die("{s} is reached through a symbolic link; uninstall leaves it alone.", .{versions});
     } else |_| die("nothing is installed in {s}", .{p.prefix});
     var found: Found = .{};
     for (modules) |m| {
@@ -883,6 +963,9 @@ pub fn main(init: std.process.Init) u8 {
     var cwd_buf: [sys.path_max]u8 = undefined;
     const cwd = a.dupe(u8, fsx.realpath(fsx.cwd, ".", &cwd_buf) catch "/") catch oom();
     const c: Ctx = .{ .a = a, .env = init.environ_map, .envp = init.minimal.environ.block.slice.ptr, .cwd = cwd };
+    if (comptime build_options.test_ops) {
+        if (nonEmpty(c.env.get("EB_LOCAL_TEST_SELF_OWNER"))) |v| test_self_owner = std.fmt.parseInt(linux.uid_t, v, 10) catch null;
+    }
 
     var args: []const [:0]const u8 = argv_all[1..];
     var command: Command = .build;

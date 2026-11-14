@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.1.1
+
+Fixes from an adversarial review of 2.1.0:
+
+* Only a site file (owned by root or by the account that installed
+  eb-local) may set `[storage]`; a file of your own named with `--config`
+  or `EB_LOCAL_CONFIG` is a user file, and the site file is always read.
+  Shared scratch and node-local trees are compared after resolving symbolic
+  links, and the installation's `versions` and `.eb-local` trees must not
+  lead onto them.
+* Secrets: the log directory is made private (0700) for a build that has
+  them; the copy of the log EasyBuild keeps in an installation's
+  `easybuild/` is cleaned too; base64 and percent-encoded forms of a value
+  are removed with it; a value too short to remove, and a log too large or
+  too deep to check, is reported.
+* `uninstall` looks only at installations (beside their module files, per
+  CPU target), never descends into installed software, and refuses any
+  path through a symbolic link.
+* The build command keeps the signal dispositions it was started with, so
+  `nohup eb-local ...` survives a hangup.
+* `clean` checks for rtrash or `--delete` before it removes anything, and
+  says how many workspaces it removed.
+* Paths are made canonical as `readlink -m` does (`link/..` is the parent
+  of the link's target).
+* The TOML reader refuses arrays nested more than 32 deep and files of more
+  than 10000 keys and items.
+
 ## 2.1.0
 
 * `eb-local uninstall NAME/VERSION...`: an installation and its module file,

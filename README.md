@@ -143,9 +143,9 @@ SOURCE_TOKEN = "file:~/.secrets/source-token"   # your file, mode 600
 MIRROR_PASSWORD = "env:MY_MIRROR_PASSWORD"
 ```
 
-- Values are read only for a build, after every other check, and go only into `eb`'s environment.
+- Values are read only for a build, after every other check, and go only into the environment of `eb` and what it runs.
 - `eb-local config --check` reads each secret and reports `ok` or why not, never the value.
-- After the build, every log written during it has each value replaced with `<secret NAME removed by eb-local>`.
+- After the build, the logs written during it (in `.eb-local/logs` and each installation's `easybuild/`) have each value, and its base64 and percent-encoded forms, replaced with `<secret NAME removed by eb-local>`; the log directory is private meanwhile. A value shorter than 4 bytes, or a log that is too large or too deep to check, is reported instead. A secret reaches every program the build runs, and a build killed before it ends leaves its logs unchecked.
 - A secret cannot set `PATH`, `LD_*`, `EESSI_*`, `EASYBUILD_*` or another variable the build depends on.
 - [nimvault](https://github.com/HaoZeke/nimvault) runs with a 30-second deadline; on failure eb-local shows its error output, never what it printed as the value.
 
