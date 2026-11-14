@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import unittest
 
+import binary
+
 SCRIPT = Path(__file__).resolve().parents[1] / "eb-local"
 CLEAR = (
     "EESSI_CVMFS_INSTALL", "EESSI_SITE_INSTALL", "EESSI_USER_INSTALL", "EESSI_PROJECT_INSTALL",
@@ -114,8 +116,8 @@ class EnvironmentControls(unittest.TestCase):
         self.env.update({name: "inherited" for name in CLEAR})
 
     def run_wrapper(self, arguments, **extra):
-        return subprocess.run(["bash", str(self.script)] + arguments,
-                              env=dict(self.env, **extra), cwd=self.root, text=True, capture_output=True)
+        argv, env = binary.command(self.script, arguments, dict(self.env, **extra))
+        return subprocess.run(argv, env=env, cwd=self.root, text=True, capture_output=True)
 
     def check_build(self, mode, status=0):
         arguments = ["recipe with spaces.eb", "--robot", "--hooks=/private site/hooks.py",
@@ -169,7 +171,8 @@ class EnvironmentControls(unittest.TestCase):
     def test_allocation_is_required(self):
         env = dict(self.env)
         env.pop("SLURM_JOB_ID")
-        run = subprocess.run(["bash", str(SCRIPT), "recipe.eb"], env=env, cwd=self.root, text=True, capture_output=True)
+        argv, env = binary.command(SCRIPT, ["recipe.eb"], env)
+        run = subprocess.run(argv, env=env, cwd=self.root, text=True, capture_output=True)
         self.assertEqual(run.returncode, 2, run.stderr)
         self.assertFalse((self.root / "load.json").exists())
 

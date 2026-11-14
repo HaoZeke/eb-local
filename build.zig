@@ -34,7 +34,8 @@ pub fn build(b: *std.Build) void {
     const unit = b.addTest(.{ .root_module = mod });
     b.step("unit", "Run the unit tests").dependOn(&b.addRunArtifact(unit).step);
 
-    // The 1.x command-line suite, run against this binary.
+    // The 1.x command-line suite, run against this binary; it needs the
+    // test artifact: zig build -Dtest-ops=true test.
     const suite = b.addSystemCommand(&.{ "bash", "-c", "EB_LOCAL_BIN=\"$0\" exec python3 -m unittest discover -s tests" });
     suite.addArtifactArg(exe);
     suite.expectExitCode(0);

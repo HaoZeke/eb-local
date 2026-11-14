@@ -119,6 +119,7 @@ pub fn jobRoot(
     job_id: []const u8,
     user: []const u8,
     mountinfo: []const u8,
+    uid: linux.uid_t,
     r: *Refusal,
 ) Error!JobRoot {
     if (job_id.len == 0 or job_id[0] == '0') return refuse(a, r, "invalid Slurm allocation identity.", .{});
@@ -136,7 +137,7 @@ pub fn jobRoot(
     var buf: [sys.path_max]u8 = undefined;
     const real = fsx.realpath(fsx.cwd, path, &buf) catch return refuse(a, r, "cannot resolve allocation node-local root.", .{});
     if (!std.mem.eql(u8, real, path)) return refuse(a, r, "allocation node-local root must be canonical.", .{});
-    if (st.uid != linux.getuid()) return refuse(a, r, "allocation node-local root belongs to another user.", .{});
+    if (st.uid != uid) return refuse(a, r, "allocation node-local root belongs to another user.", .{});
     const m = (try mountOf(a, mountinfo, path)) orelse return refuse(a, r, "cannot inspect allocation mount.", .{});
     if (!std.mem.eql(u8, m.fstype, fstype))
         return refuse(a, r, "allocation node-local root must use {s}, not shared or memory-backed storage.", .{fstype});
@@ -150,13 +151,13 @@ pub fn jobRoot(
 
 /// A workspace eb-local made: a real directory of the caller named
 /// eb-local.XXXXXXXX directly in the job mount.
-pub fn ownWorkspace(job_root: []const u8, path: []const u8) bool {
+pub fn ownWorkspace(job_root: []const u8, path: []const u8, uid: linux.uid_t) bool {
     if (!std.mem.startsWith(u8, path, job_root) or path.len != job_root.len + 1 + "eb-local.".len + 8) return false;
     const name = path[job_root.len + 1 ..];
     if (path[job_root.len] != '/' or !std.mem.startsWith(u8, name, "eb-local.")) return false;
     for (name["eb-local.".len..]) |c| if (!std.ascii.isAlphanumeric(c)) return false;
     const st = fsx.statAt(fsx.cwd, path, false) catch return false;
-    return st.isDir() and st.uid == linux.getuid();
+    return st.isDir() and st.uid == uid;
 }
 
 /// A new eb-local.XXXXXXXX directory, mode 0700, in `job_root`.
@@ -214,4 +215,24 @@ test "canonical paths" {
     try testing.expect(under("/a/b", "/a"));
     try testing.expect(under("/a", "/a"));
     try testing.expect(!under("/ab", "/a"));
+}
+
+test "the job mount is refused when another user owns it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const nodes = try std.fmt.allocPrint(a, "{s}/.zig-cache/storage-test-{d}", .{ cwd, linux.getpid() });
+    const job = try std.fmt.allocPrint(a, "{s}/u.42", .{nodes});
+    try common.atomic.makedirs(job);
+    defer fsx.deleteTree(a, fsx.cwd, nodes) catch {};
+    const info = try std.fmt.allocPrint(a, "1 0 0:1 / / rw - ext4 /dev/x rw\n2 1 0:2 / {s} rw,relatime - xfs /dev/y rw\n", .{job});
+    var r: Refusal = .{};
+    const ok = try jobRoot(a, nodes, "xfs", "42", "u", info, linux.getuid(), &r);
+    try testing.expectEqualStrings(job, ok.path);
+    try testing.expectError(error.Refused, jobRoot(a, nodes, "xfs", "42", "u", info, linux.getuid() + 1, &r));
+    try testing.expect(std.mem.indexOf(u8, r.message, "another user") != null);
+    try testing.expectError(error.Refused, jobRoot(a, nodes, "gpfs", "42", "u", info, linux.getuid(), &r));
+    try testing.expectError(error.Refused, jobRoot(a, nodes, "xfs", "042", "u", info, linux.getuid(), &r));
 }

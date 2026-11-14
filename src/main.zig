@@ -460,11 +460,20 @@ fn mountinfoText(c: Ctx) []const u8 {
     return fsx.readAll(c.a, fd, 8 << 20) catch die("cannot read {s}", .{path});
 }
 
+/// The caller's uid. Only the test artifact lets EB_LOCAL_TEST_UID stand in,
+/// so that a test can make its own directory look like another user's.
+fn callerUid(c: Ctx) linux.uid_t {
+    if (comptime build_options.test_ops) {
+        if (nonEmpty(c.env.get("EB_LOCAL_TEST_UID"))) |v| return std.fmt.parseInt(linux.uid_t, v, 10) catch linux.getuid();
+    }
+    return linux.getuid();
+}
+
 fn checkedJobRoot(c: Ctx, s: config.Settings) []const u8 {
     if (s.node_local_root.value.len == 0) die("no node-local root is configured; set storage.node_local_root in the site configuration (see the README).", .{});
     var r: storage.Refusal = .{};
     const job_id = c.env.get("SLURM_JOB_ID") orelse "";
-    const jr = storage.jobRoot(c.a, s.node_local_root.value, s.node_local_fstype.value, job_id, userName(c), mountinfoText(c), &r) catch |e| switch (e) {
+    const jr = storage.jobRoot(c.a, s.node_local_root.value, s.node_local_fstype.value, job_id, userName(c), mountinfoText(c), callerUid(c), &r) catch |e| switch (e) {
         error.Refused => die("{s}", .{r.message}),
         error.OutOfMemory => oom(),
     };
@@ -579,7 +588,7 @@ fn cmdClean(c: Ctx, s: config.Settings, o: CleanOpts) u8 {
         var it = fsx.DirIter.init(a, fd) catch die("cannot read {s}", .{jr});
         while (it.next() catch null) |e| {
             const full = std.fs.path.join(a, &.{ jr, e.name }) catch oom();
-            if (storage.ownWorkspace(jr, full)) spaces.append(a, full) catch oom();
+            if (storage.ownWorkspace(jr, full, callerUid(c))) spaces.append(a, full) catch oom();
         }
     }
     const targets = collect.out.items;
@@ -730,7 +739,7 @@ fn cmdBuild(c: Ctx, s: config.Settings, args: []const []const u8) u8 {
 
     const keep = std.mem.eql(u8, c.env.get("EB_LOCAL_KEEP_WORK") orelse "", "1");
     if (rc == 0 and !keep) {
-        if (storage.ownWorkspace(job_root, work)) fsx.deleteTree(a, fsx.cwd, work) catch |e|
+        if (storage.ownWorkspace(job_root, work, callerUid(c))) fsx.deleteTree(a, fsx.cwd, work) catch |e|
             warn("cannot remove {s} ({s}); it goes when the allocation ends", .{ work, @errorName(e) });
     } else {
         warn("build workspace kept at {s}; it goes when the allocation ends,", .{work});

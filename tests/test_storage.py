@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import unittest
 
+import binary
+
 SCRIPT = Path(__file__).resolve().parents[1] / "eb-local"
 MUTABLE = (
     "WORKING_DIR", "TMPDIR", "TMP", "TEMP", "EASYBUILD_BUILDPATH",
@@ -102,9 +104,8 @@ class StorageFixture(unittest.TestCase):
             self.env.pop(name, None)
 
     def run_wrapper(self, args=None, **extra):
-        return subprocess.run(["bash", str(self.script)] + (args or ["recipe.eb"]),
-                              env=dict(self.env, **extra), cwd=self.root,
-                              capture_output=True, text=True)
+        argv, env = binary.command(self.script, args or ["recipe.eb"], dict(self.env, **extra))
+        return subprocess.run(argv, env=env, cwd=self.root, capture_output=True, text=True)
 
     def refused(self, **extra):
         run = self.run_wrapper(**extra)
