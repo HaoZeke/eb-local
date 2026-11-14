@@ -1,0 +1,83 @@
+name: release
+# On a tag vX.Y.Z: build the static binaries, test each on its own
+# architecture, check the version string against the tag, and publish the
+# binaries with SHA256SUMS and build provenance attestations.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: zig build unit --summary all
+      - run: zig build -Dtest-ops=true test --summary all
+      - name: build
+        run: |
+          zig build --release=safe -Dcommit="${GITHUB_SHA::7}" -Dtarget=${{ matrix.arch }}-linux-musl --prefix out
+          want="eb-local ${GITHUB_REF_NAME#v} "
+          zon=$(sed -nE 's/^ *\.version = "([^"]+)".*/\1/p' build.zig.zon)
+          if [ "${zon}" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "versions: tag ${GITHUB_REF_NAME}, build.zig.zon ${zon}"; exit 1
+          fi
+          ! grep -aq EB_LOCAL_TEST_MOUNTINFO out/bin/eb-local
+          got=$(out/bin/eb-local --version)
+          case "${got}" in "${want}"*) ;; *) echo "version '${got}' does not match tag ${GITHUB_REF_NAME}"; exit 1 ;; esac
+          mkdir dist
+          cp out/bin/eb-local "dist/eb-local-${GITHUB_REF_NAME#v}-${{ matrix.arch }}-linux-musl"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.arch }}
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The release notes are the tag's section of CHANGELOG.md, "## X.Y.Z"
+      # or "## [X.Y.Z] - date"; a tag without one is not released.
+      - name: release notes from CHANGELOG.md
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '/^## /{ if (on) exit; h = $0; sub(/^## \[?/, "", h); sub(/[] ].*$/, "", h); on = (h == v); next } on' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then echo "CHANGELOG.md has no section for ${v}"; exit 1; fi
+          cat release-notes.md
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: dist
+      - run: cd dist && sha256sum eb-local-* > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md --draft
