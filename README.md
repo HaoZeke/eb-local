@@ -1,6 +1,16 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="branding/logo/logo-dark.svg">
+    <img src="branding/logo/logo-light.svg" alt="eb-local" width="420">
+  </picture>
+</p>
+
 # eb-local
 
+<!-- docs:start -->
 Install software with EasyBuild on top of [EESSI](https://www.eessi.io) 2026.06, into a directory you own.
+
+Documentation: <https://stackhands.github.io/eb-local/>
 
 `eb-local` sets `EESSI_USER_INSTALL` (or `EESSI_PROJECT_INSTALL`), loads `EESSI/2026.06` and `EESSI-extend/2026.06-easybuild`, and runs `eb`.
 EESSI-extend supplies EESSI's hooks, RPATH wrappers and compat layer, so what you build links against the same libraries as the EESSI modules.
@@ -73,4 +83,20 @@ Copy it onto `PATH`, or install it with the matching released easyconfig.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](https://github.com/stackhands/eb-local/blob/main/LICENSE).
+
+<!-- stackhands:begin -->
+## Part of stackhands
+
+eb-local is one of the [stackhands](https://github.com/stackhands) tools for building, installing and maintaining an HPC software stack with EasyBuild on top of EESSI.
+
+| Tool | Job | Docs |
+|---|---|---|
+| [eb-stack](https://github.com/stackhands/eb-stack) | Solve, shard and plan an EasyBuild build list; admit builds under a scratch inode budget | [docs](https://eb-stack.rgoswami.me/) |
+| [eb-staged-rebuild](https://github.com/stackhands/eb-staged-rebuild) | Rebuild an installation in a staged tree and swap it in, so running jobs keep their paths | [docs](https://stackhands.github.io/eb-staged-rebuild/) |
+| [eessi-arch-guard](https://github.com/stackhands/eessi-arch-guard) | Reload EESSI in a Slurm task that inherited it for another CPU or GPU | [docs](https://stackhands.github.io/eessi-arch-guard/) |
+| **eb-local** | Install software with EasyBuild on top of EESSI into a directory a user or project owns | [docs](https://stackhands.github.io/eb-local/) |
+| [eb-keep-logs](https://github.com/stackhands/eb-keep-logs) | Keep a failed build's EasyBuild log and command output; rotate a pipeline's log tree | [docs](https://stackhands.github.io/eb-keep-logs/) |
+| [rfc9162](https://github.com/stackhands/rfc9162) | Append-only Merkle logs hashed as RFC 9162, with tiled storage and signed checkpoints | [docs](https://stackhands.github.io/rfc9162/) |
+| [zig-common](https://github.com/stackhands/zig-common) | The shared Zig library under the Zig tools: system calls, checked files, child processes | [docs](https://stackhands.github.io/zig-common/) |
+<!-- stackhands:end -->

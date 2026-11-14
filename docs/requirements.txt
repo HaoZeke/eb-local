@@ -1,0 +1,4 @@
+Sphinx==8.2.3
+myst-parser==5.1.0
+shibuya==2025.12.13
+sphinx-copybutton==0.5.2
