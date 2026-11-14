@@ -1,0 +1,19 @@
+.{
+    .name = .eb_local,
+    .version = "2.0.0",
+    .fingerprint = 0x512ce9ad65023f55,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .zig_common = .{
+            .url = "git+https://github.com/stackhands/zig-common#v0.8.1",
+            .hash = "zig_common-0.8.1-kBaPebgtAwBole26eQY2FNhyv-weVJPVgRBzkVySHIe-",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
