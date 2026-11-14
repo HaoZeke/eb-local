@@ -72,7 +72,9 @@ def write_config(path, nodes, extra=""):
     path.chmod(0o600)
 
 
-class StorageControls(unittest.TestCase):
+class StorageFixture(unittest.TestCase):
+    """The fixture, without tests; test_commands builds on it too."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="eb-local-storage-")
         self.addCleanup(self.tmp.cleanup)
@@ -111,6 +113,8 @@ class StorageControls(unittest.TestCase):
         self.assertFalse((self.root / "load.json").exists())
         self.assertEqual(list(self.job.iterdir()), [])
 
+
+class StorageControls(StorageFixture):
     def test_missing_allocation_creates_no_prefix_or_workspace(self):
         self.refused(SLURM_JOB_ID="")
 
@@ -153,7 +157,8 @@ class StorageControls(unittest.TestCase):
 
     def test_build_paths_survive_unload_and_module_initialization(self):
         args = ["recipe with spaces.eb", "--hooks=/selected/custom.py", "--robot"]
-        run = self.run_wrapper(args)
+        # Kept, so the paths the build used can be inspected afterwards.
+        run = self.run_wrapper(args, EB_LOCAL_KEEP_WORK="1")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         loaded = json.loads((self.root / "load.json").read_text())
         built = json.loads((self.root / "eb.json").read_text())

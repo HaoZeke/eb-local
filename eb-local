@@ -1,33 +1,91 @@
 #!/bin/bash
-# eb-local: install software with EasyBuild on top of EESSI 2026.06, into a
+# eb-local: install and build software on top of EESSI 2026.06, into a
 # directory you own. The 2026 replacement for eblocalinstall.
 #
-#   eb-local <easyconfig> [eb options]     build and install
-#   eb-local --project DIR <easyconfig>    install into a shared project directory
-#   eb-local --env [--project DIR]         print the lines that make the modules visible
-#   eb-local --help
+#   eb-local <easyconfig> [eb options]   build and install with EasyBuild
+#   eb-local env                         lines that make your installed modules visible
+#   eb-local dev [MODULE...]             the same, plus MODULEs and a build environment,
+#                                        so gcc, make, cmake and meson just work
+#   eb-local clean [--logs-older-than DAYS] [--sources] [--workspaces] [--dry-run] [--delete]
+#                                        remove what eb-local left behind
+#   eb-local help
 #
-# Installs go to $HOME/.local/eessi (or the project directory), which persists.
-# Mutable work uses the allocation's own node-local mount, named in the site
-# configuration (eb-local.conf). Sources and logs persist beside the
-# installation. EESSI-extend supplies EESSI's hooks, RPATH and compat layer.
+# Every command takes --project DIR to use a shared project directory instead
+# of $HOME/.local/eessi. Use env and dev with eval:
+#
+#   eval "$(eb-local env)"
+#   eval "$(eb-local dev FFTW/3.3.10-GCC-15.2.0)"
+#
+# Builds use the allocation's own node-local mount, named in the site
+# configuration (eb-local.conf); a successful build removes its workspace.
+# Sources and logs persist beside the installation; clean moves old ones to
+# the trash with rtrash when it is installed. EESSI-extend supplies EESSI's
+# hooks, RPATH and compat layer.
 set -eo pipefail   # no -u: the Lmod init reads unset variables
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+
+die() {
+    echo "eb-local: $*" >&2
+    exit 2
+}
+fail_storage() { die "$@"; }
+
+# Module names as Lmod writes them. Anything else could change the meaning of
+# the lines env and dev print for eval, so it is refused.
+valid_module() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*(/[A-Za-z0-9._+-]+)*$ ]]; }
 
 prefix="${EB_LOCAL_PREFIX:-$HOME/.local/eessi}"
 mode=user
-env_only=false
+command=build
+case "${1:-}" in
+    env|dev|clean) command="$1"; shift ;;
+    help|-h|--help) usage; exit 0 ;;
+    --env) command="env"; shift ;;
+esac
 args=()
+dev_modules=()
+buildenv_override=""
+logs_days=30
+clean_logs=true
+clean_sources=false
+clean_workspaces=false
+dry_run=false
+allow_delete=false
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
-        --env) env_only=true; shift ;;
         --project)
-            [ -n "${2:-}" ] || { echo "eb-local: --project needs a directory" >&2; exit 2; }
+            [ -n "${2:-}" ] || die "--project needs a directory"
             prefix="$2"; mode=project; shift 2 ;;
         --project=*) prefix="${1#--project=}"; mode=project; shift ;;
-        *) args+=("$1"); shift ;;
+        --env)
+            if [ "$command" = build ] && [ ${#args[@]} -eq 0 ]; then command="env"; else args+=("$1"); fi
+            shift ;;
+        *)
+            case "$command" in
+                build) args+=("$1"); shift ;;
+                env) die "env takes only --project; got '$1'" ;;
+                dev)
+                    case "$1" in
+                        --buildenv) [ -n "${2:-}" ] || die "--buildenv needs a module"; buildenv_override="$2"; shift 2 ;;
+                        --buildenv=*) buildenv_override="${1#--buildenv=}"; shift ;;
+                        -*) die "dev does not know the option '$1'" ;;
+                        *) valid_module "$1" || die "'$1' is not a module name"; dev_modules+=("$1"); shift ;;
+                    esac ;;
+                clean)
+                    case "$1" in
+                        --logs-older-than)
+                            [[ "${2:-}" =~ ^[0-9]{1,5}$ ]] || die "--logs-older-than needs a number of days"
+                            logs_days="$2"; shift 2 ;;
+                        --no-logs) clean_logs=false; shift ;;
+                        --sources) clean_sources=true; shift ;;
+                        --workspaces) clean_workspaces=true; shift ;;
+                        --dry-run) dry_run=true; shift ;;
+                        --delete) allow_delete=true; shift ;;
+                        *) die "clean does not know '$1'" ;;
+                    esac ;;
+            esac ;;
     esac
 done
 
@@ -41,43 +99,6 @@ if [ -d "$prefix" ]; then
     prefix=$(cd "$prefix" && pwd -P)
 fi
 
-clear_install_environment() {
-    unset EESSI_CVMFS_INSTALL EESSI_SITE_INSTALL EESSI_USER_INSTALL EESSI_PROJECT_INSTALL
-    unset EESSI_SITE_SOFTWARE_PREFIX
-    unset EESSI_SOFTWARE_SUBDIR_OVERRIDE EESSI_ACCELERATOR_TARGET_OVERRIDE EESSI_OVERRIDE_GPU_CHECK
-    unset EASYBUILD_INSTALLPATH EASYBUILD_INSTALLPATH_SOFTWARE EASYBUILD_INSTALLPATH_MODULES EASYBUILD_PREFIX
-}
-
-print_environment() {
-    printf '%s\n' 'module unload EESSI-extend/2026.06-easybuild >/dev/null 2>&1 || true'
-    printf '%s\n' \
-        'unset EESSI_CVMFS_INSTALL EESSI_SITE_INSTALL EESSI_USER_INSTALL EESSI_PROJECT_INSTALL' \
-        'unset EESSI_SITE_SOFTWARE_PREFIX' \
-        'unset EESSI_SOFTWARE_SUBDIR_OVERRIDE EESSI_ACCELERATOR_TARGET_OVERRIDE EESSI_OVERRIDE_GPU_CHECK' \
-        'unset EASYBUILD_INSTALLPATH EASYBUILD_INSTALLPATH_SOFTWARE EASYBUILD_INSTALLPATH_MODULES EASYBUILD_PREFIX'
-    if [ "$mode" = project ]; then
-        printf 'export EESSI_PROJECT_INSTALL=%q\n' "$prefix"
-    else
-        printf 'export EESSI_USER_INSTALL=%q\n' "$prefix"
-    fi
-    printf '%s\n' 'module load EESSI/2026.06 EESSI-extend/2026.06-easybuild'
-}
-
-if [ "$env_only" = true ]; then
-    print_environment
-    exit 0
-fi
-
-if [ ${#args[@]} -eq 0 ]; then
-    usage >&2
-    exit 2
-fi
-
-fail_storage() {
-    echo "eb-local: $*" >&2
-    exit 2
-}
-
 # Site configuration. The file is parsed, never sourced. It is trusted only
 # when it is a regular file, not a symlink, not writable by group or others,
 # and owned by root, by the owner of this script (the installer), or by the
@@ -87,10 +108,18 @@ fail_storage() {
 #   node_local_fstype = xfs    file system type the allocation mount must have
 #   shared_scratch = /a /b     shared scratch trees refused as install prefix
 #   allocation_hint = text     example allocation printed outside a job
+#   stack_module = NAME        the stack env and dev load (EESSI/2026.06)
+#   extend_module = NAME       EESSI-extend (EESSI-extend/2026.06-easybuild)
+#   dev_buildenv = NAME        the build environment dev loads last
+#   trash = auto|rtrash|none   how clean removes durable files (auto: rtrash if found)
 node_local_root=""
 node_local_fstype=xfs
 shared_scratch=""
 allocation_hint=""
+stack_module="EESSI/2026.06"
+extend_module="EESSI-extend/2026.06-easybuild"
+dev_buildenv="buildenv/default-foss-2026.1"
+trash=auto
 config_file=""
 
 config_trusted() {
@@ -130,6 +159,11 @@ read_config() {
                 done
                 shared_scratch="$value" ;;
             allocation_hint) allocation_hint="$value" ;;
+            stack_module|extend_module|dev_buildenv)
+                valid_module "$value" || fail_storage "$file: $key must be one module name."
+                printf -v "$key" '%s' "$value" ;;
+            trash)
+                case "$value" in auto|rtrash|none) trash="$value" ;; *) fail_storage "$file: trash is auto, rtrash or none." ;; esac ;;
             *) fail_storage "$file: unknown setting '$key'." ;;
         esac
     done < "$file"
@@ -148,6 +182,184 @@ for candidate in ${EB_LOCAL_CONFIG:+"$EB_LOCAL_CONFIG"} "$script_dir/eb-local.co
     fi
 done
 [ -z "$config_file" ] || read_config "$config_file"
+if [ -n "$buildenv_override" ]; then
+    valid_module "$buildenv_override" || die "'$buildenv_override' is not a module name"
+    dev_buildenv="$buildenv_override"
+fi
+case "${EB_LOCAL_TRASH:-}" in
+    "") ;;
+    auto|rtrash|none) trash="$EB_LOCAL_TRASH" ;;
+    *) die "EB_LOCAL_TRASH is auto, rtrash or none" ;;
+esac
+
+clear_install_environment() {
+    unset EESSI_CVMFS_INSTALL EESSI_SITE_INSTALL EESSI_USER_INSTALL EESSI_PROJECT_INSTALL
+    unset EESSI_SITE_SOFTWARE_PREFIX
+    unset EESSI_SOFTWARE_SUBDIR_OVERRIDE EESSI_ACCELERATOR_TARGET_OVERRIDE EESSI_OVERRIDE_GPU_CHECK
+    unset EASYBUILD_INSTALLPATH EASYBUILD_INSTALLPATH_SOFTWARE EASYBUILD_INSTALLPATH_MODULES EASYBUILD_PREFIX
+}
+
+# The lines env and dev print. Every value is quoted with %q, and module names
+# are checked above, so the output means the same whatever the input.
+print_environment() {
+    printf 'module unload %q >/dev/null 2>&1 || true\n' "$extend_module"
+    printf '%s\n' \
+        'unset EESSI_CVMFS_INSTALL EESSI_SITE_INSTALL EESSI_USER_INSTALL EESSI_PROJECT_INSTALL' \
+        'unset EESSI_SITE_SOFTWARE_PREFIX' \
+        'unset EESSI_SOFTWARE_SUBDIR_OVERRIDE EESSI_ACCELERATOR_TARGET_OVERRIDE EESSI_OVERRIDE_GPU_CHECK' \
+        'unset EASYBUILD_INSTALLPATH EASYBUILD_INSTALLPATH_SOFTWARE EASYBUILD_INSTALLPATH_MODULES EASYBUILD_PREFIX'
+    if [ "$mode" = project ]; then
+        printf 'export EESSI_PROJECT_INSTALL=%q\n' "$prefix"
+    else
+        printf 'export EESSI_USER_INSTALL=%q\n' "$prefix"
+    fi
+    printf 'module load %q %q\n' "$stack_module" "$extend_module"
+}
+
+eval_hint() {
+    if [ -t 1 ]; then
+        echo "eb-local: these lines change nothing until the shell runs them:" >&2
+        echo "  eval \"\$(eb-local $*)\"" >&2
+    fi
+}
+
+if [ "$command" = env ]; then
+    eval_hint env
+    print_environment
+    exit 0
+fi
+
+if [ "$command" = dev ]; then
+    eval_hint "dev${dev_modules[*]:+ ${dev_modules[*]}}"
+    print_environment
+    # The modules the program uses first, the build environment last: its
+    # compiler wrappers then come first on PATH and record a run path for the
+    # library directory of every loaded module, so the program runs without
+    # LD_LIBRARY_PATH.
+    [ ${#dev_modules[@]} -eq 0 ] || { printf 'module load'; printf ' %q' "${dev_modules[@]}"; printf '\n'; }
+    printf 'module load %q\n' "$dev_buildenv"
+    if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+        echo "eb-local: LD_LIBRARY_PATH is set in this shell; programs built here do not need it," >&2
+        echo "  and it can mix host libraries into EESSI's. Unset it unless you know you need it." >&2
+    fi
+    exit 0
+fi
+
+# Durable sources and logs live beside the installation, and must stay there.
+durable_dirs() {
+    durable="$prefix/.eb-local"
+    local durable_path resolved_path
+    for durable_path in "$durable/sources" "$durable/logs"; do
+        resolved_path=$(readlink -m -- "$durable_path") || fail_storage 'cannot resolve durable source or log directory.'
+        case "$resolved_path" in
+            "$prefix"/*) ;;
+            *) fail_storage 'source and log directories must remain inside the durable prefix.' ;;
+        esac
+    done
+}
+
+# The allocation's node-local mount: the exact job mount, owned, canonical,
+# its own file system of the configured type, writable.
+check_job_root() {
+    [[ "$SLURM_JOB_ID" =~ ^[1-9][0-9]*$ ]] || fail_storage 'invalid Slurm allocation identity.'
+    job_user=$(id -un) || fail_storage 'cannot determine the allocation user.'
+    job_root="${node_local_root}/${job_user}.${SLURM_JOB_ID}"
+    case "$job_root" in
+        "$node_local_root"/*) ;;
+        *) fail_storage "node-local root must name the allocation mount below $node_local_root." ;;
+    esac
+    [ -d "$job_root" ] && [ ! -L "$job_root" ] && [ -w "$job_root" ] && [ -x "$job_root" ] ||
+        fail_storage 'allocation node-local root must be an owned writable directory.'
+    canonical_root=$(readlink -e -- "$job_root") || fail_storage 'cannot resolve allocation node-local root.'
+    [ "$canonical_root" = "$job_root" ] || fail_storage 'allocation node-local root must be canonical.'
+    [ "$(stat -c %u -- "$job_root")" = "$(id -u)" ] || fail_storage 'allocation node-local root belongs to another user.'
+    [ "$(findmnt -n -o FSTYPE --target "$job_root")" = "$node_local_fstype" ] ||
+        fail_storage "allocation node-local root must use $node_local_fstype, not shared or memory-backed storage."
+    [ "$(findmnt -n -o TARGET --target "$job_root")" = "$job_root" ] ||
+        fail_storage 'allocation node-local root must be its own mount.'
+    mount_options=$(findmnt -n -o OPTIONS --target "$job_root") ||
+        fail_storage 'cannot inspect allocation mount options.'
+    case ",$mount_options," in
+        *,rw,*) ;;
+        *) fail_storage 'allocation mount is not writable.' ;;
+    esac
+}
+
+# A workspace eb-local made in this allocation: a real directory, owned by the
+# caller, named eb-local.XXXXXXXX directly in the job mount.
+own_workspace() {
+    local dir="$1"
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    [[ "$dir" =~ ^"$job_root"/eb-local\.[A-Za-z0-9]{8}$ ]] || return 1
+    [ "$(stat -c %u -- "$dir")" = "$(id -u)" ]
+}
+
+remove_workspace() {
+    own_workspace "$1" || return 0
+    rm -rf --one-file-system -- "$1"
+}
+
+if [ "$command" = clean ]; then
+    if [ "$clean_workspaces" = true ]; then
+        [ -n "${SLURM_JOB_ID:-}" ] || die "--workspaces works inside the allocation that made them."
+        [ -n "$node_local_root" ] || fail_storage 'no node-local root is configured; set node_local_root in eb-local.conf.'
+        check_job_root
+    fi
+    durable_dirs
+    case "$trash" in
+        auto) if command -v rtrash >/dev/null 2>&1; then trash=rtrash; else trash=none; fi ;;
+        rtrash) command -v rtrash >/dev/null 2>&1 || die "trash = rtrash, but rtrash is not on PATH." ;;
+    esac
+    targets=()
+    collect() {
+        local dir="$1"; shift
+        local canonical
+        [ -d "$dir" ] || return 0
+        canonical=$(readlink -e -- "$dir") || return 0
+        [ "$canonical" = "$dir" ] || fail_storage "$dir is reached through a symbolic link; clean leaves it alone."
+        while IFS= read -r -d '' file; do targets+=("$file"); done < <(find -P "$dir" -xdev -mindepth 1 -type f "$@" -print0)
+    }
+    if [ "$clean_logs" = true ]; then collect "$durable/logs" -mtime "+$logs_days"; fi
+    if [ "$clean_sources" = true ]; then collect "$durable/sources"; fi
+    workspaces=()
+    if [ "$clean_workspaces" = true ]; then
+        for dir in "$job_root"/eb-local.*; do own_workspace "$dir" && workspaces+=("$dir"); done
+    fi
+    if [ ${#targets[@]} -eq 0 ] && [ ${#workspaces[@]} -eq 0 ]; then
+        echo "eb-local: nothing to clean in $prefix"
+        exit 0
+    fi
+    for file in "${targets[@]}"; do echo "  $file"; done
+    for dir in "${workspaces[@]}"; do echo "  $dir/ (build workspace)"; done
+    if [ "$dry_run" = true ]; then
+        echo "eb-local: dry run, nothing removed (${#targets[@]} file(s), ${#workspaces[@]} workspace(s))"
+        exit 0
+    fi
+    # Build workspaces are node-local scratch the scheduler removes anyway;
+    # they are deleted, not trashed.
+    for dir in "${workspaces[@]}"; do remove_workspace "$dir"; done
+    if [ ${#targets[@]} -gt 0 ]; then
+        if [ "$trash" = rtrash ]; then
+            rtrash put -- "${targets[@]}"
+            echo "eb-local: moved ${#targets[@]} file(s) to the trash (rtrash list, rtrash restore)"
+        elif [ "$allow_delete" = true ]; then
+            rm -f -- "${targets[@]}"
+            echo "eb-local: deleted ${#targets[@]} file(s)"
+        else
+            echo "eb-local: rtrash is not installed; nothing deleted. Install rtrash, or pass --delete to delete for good." >&2
+            exit 1
+        fi
+        for dir in "$durable/logs" "$durable/sources"; do
+            [ -d "$dir" ] && [ ! -L "$dir" ] && find -P "$dir" -xdev -mindepth 1 -type d -empty -delete
+        done
+    fi
+    exit 0
+fi
+
+if [ ${#args[@]} -eq 0 ]; then
+    usage >&2
+    exit 2
+fi
 
 if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "eb-local: not inside a Slurm job." >&2
@@ -160,28 +372,7 @@ fi
 [ -n "$node_local_root" ] || fail_storage 'no node-local root is configured; set node_local_root in eb-local.conf (see the README).'
 
 # The scheduler's exact job mount keeps mutable work outside shared quotas.
-[[ "$SLURM_JOB_ID" =~ ^[1-9][0-9]*$ ]] || fail_storage 'invalid Slurm allocation identity.'
-job_user=$(id -un) || fail_storage 'cannot determine the allocation user.'
-job_root="${node_local_root}/${job_user}.${SLURM_JOB_ID}"
-case "$job_root" in
-    "$node_local_root"/*) ;;
-    *) fail_storage "node-local root must name the allocation mount below $node_local_root." ;;
-esac
-[ -d "$job_root" ] && [ ! -L "$job_root" ] && [ -w "$job_root" ] && [ -x "$job_root" ] ||
-    fail_storage 'allocation node-local root must be an owned writable directory.'
-canonical_root=$(readlink -e -- "$job_root") || fail_storage 'cannot resolve allocation node-local root.'
-[ "$canonical_root" = "$job_root" ] || fail_storage 'allocation node-local root must be canonical.'
-[ "$(stat -c %u -- "$job_root")" = "$(id -u)" ] || fail_storage 'allocation node-local root belongs to another user.'
-[ "$(findmnt -n -o FSTYPE --target "$job_root")" = "$node_local_fstype" ] ||
-    fail_storage "allocation node-local root must use $node_local_fstype, not shared or memory-backed storage."
-[ "$(findmnt -n -o TARGET --target "$job_root")" = "$job_root" ] ||
-    fail_storage 'allocation node-local root must be its own mount.'
-mount_options=$(findmnt -n -o OPTIONS --target "$job_root") ||
-    fail_storage 'cannot inspect allocation mount options.'
-case ",$mount_options," in
-    *,rw,*) ;;
-    *) fail_storage 'allocation mount is not writable.' ;;
-esac
+check_job_root
 
 prefix=$(readlink -m -- "$prefix") || fail_storage 'cannot resolve installation prefix.'
 for refused in "$node_local_root" $shared_scratch; do
@@ -193,17 +384,24 @@ done
 mkdir -p -- "$prefix"
 [ -w "$prefix" ] && [ -x "$prefix" ] || fail_storage 'installation prefix is not writable.'
 prefix=$(cd "$prefix" && pwd -P)
-durable="$prefix/.eb-local"
-for durable_path in "$durable/sources" "$durable/logs"; do
-    resolved_path=$(readlink -m -- "$durable_path") || fail_storage 'cannot resolve durable source or log directory.'
-    case "$resolved_path" in
-        "$prefix"/*) ;;
-        *) fail_storage 'source and log directories must remain inside the durable prefix.' ;;
-    esac
-done
+durable_dirs
 work=$(mktemp -d "$job_root/eb-local.XXXXXXXX") || fail_storage 'cannot create allocation workspace.'
 mkdir -p -- "$work/build" "$work/tmp" "$work/cache" "$work/cargo" "$work/source-index" \
     "$durable/sources" "$durable/logs"
+
+# A build that succeeds leaves no workspace behind; one that fails keeps it
+# for inspection until the allocation ends. EB_LOCAL_KEEP_WORK=1 always keeps it.
+rc=1
+# shellcheck disable=SC2329  # run by the EXIT trap
+finish() {
+    if [ "$rc" -eq 0 ] && [ "${EB_LOCAL_KEEP_WORK:-}" != 1 ]; then
+        remove_workspace "$work"
+    elif [ -d "$work" ]; then
+        echo "eb-local: build workspace kept at $work; it goes when the allocation ends," >&2
+        echo "  or now with: eb-local clean --workspaces --no-logs" >&2
+    fi
+}
+trap finish EXIT
 
 select_storage_environment() {
     export WORKING_DIR="$work/source-index"
@@ -225,7 +423,7 @@ fi
 type module >/dev/null 2>&1 || { echo "eb-local: no module command found" >&2; exit 1; }
 
 # EESSI-extend reads the variables above when it loads, so load it fresh.
-module unload EESSI-extend/2026.06-easybuild >/dev/null 2>&1 || true
+module unload "$extend_module" >/dev/null 2>&1 || true
 clear_install_environment
 select_storage_environment
 if [ "$mode" = project ]; then
@@ -233,8 +431,8 @@ if [ "$mode" = project ]; then
 else
     export EESSI_USER_INSTALL="$prefix"
 fi
-module load EESSI/2026.06 EESSI-extend/2026.06-easybuild >/dev/null 2>&1 || {
-    echo "eb-local: could not load EESSI/2026.06 and EESSI-extend/2026.06-easybuild" >&2
+module load "$stack_module" "$extend_module" >/dev/null 2>&1 || {
+    echo "eb-local: could not load $stack_module and $extend_module" >&2
     exit 1
 }
 select_storage_environment
@@ -246,6 +444,10 @@ eb --umask=022 "${args[@]}" || rc=$?
 if [ "$rc" -eq 0 ]; then
     echo
     echo "eb-local: done. To use the modules in a new shell or job:"
-    print_environment
+    if [ "$mode" = project ]; then
+        echo "  eval \"\$(eb-local env --project $(printf '%q' "$prefix"))\""
+    else
+        echo "  eval \"\$(eb-local env)\""
+    fi
 fi
 exit "$rc"
