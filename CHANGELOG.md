@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.0
+
+* `eb-local uninstall NAME/VERSION...`: an installation and its module file,
+  for every CPU target under the installation directory, made writable (an
+  EasyBuild installation is read-only, so `rm -rf` fails on it) and moved to
+  the trash with rtrash, or deleted with `--delete`; `--dry-run` lists them.
+  A symbolic link is never followed.
+
 ## 2.0.0
 
 eb-local in Zig, one static binary per architecture; the Bash script stays

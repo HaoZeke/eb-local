@@ -85,6 +85,15 @@ eb-local clean --workspaces --no-logs   # inside an allocation: its leftover wor
 With [rtrash](https://github.com/HaoZeke/rtrash) on `PATH`, files go to the trash (`rtrash list`, `rtrash restore`); without it, nothing is deleted unless you pass `--delete`.
 `clean` never follows a symbolic link out of the installation directory.
 
+To remove something you installed, for every CPU target you built it for:
+
+```sh
+eb-local uninstall pigz/2.8-GCCcore-15.2.0 --dry-run
+eb-local uninstall pigz/2.8-GCCcore-15.2.0      # to the trash with rtrash, or --delete
+```
+
+EasyBuild leaves installations read-only, so `rm -rf` fails on them; `uninstall` makes them writable first, and removes the module files with them.
+
 ## Configuration
 
 Settings come from, lowest first: built-in defaults, the site file, a site profile, your file, your profile, `EB_LOCAL_*` variables, options.

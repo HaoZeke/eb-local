@@ -16,7 +16,7 @@ pub const storage = @import("storage.zig");
 const Allocator = std.mem.Allocator;
 
 const tool = "eb-local";
-pub const version = "2.0.0";
+pub const version = "2.1.0";
 
 const usage_text =
     \\eb-local: install and build software on top of EESSI 2026.06, into a
@@ -31,6 +31,9 @@ const usage_text =
     \\  eb-local config [--check]            the settings in force and where each came from;
     \\                                       --check also reads every secret (values not shown)
     \\  eb-local profiles                    the profiles the configuration defines
+    \\  eb-local uninstall NAME/VERSION... [--dry-run] [--delete]
+    \\                                       remove an installation and its module file, for
+    \\                                       every CPU target, to the trash with rtrash
     \\  eb-local help | --version
     \\
     \\Every command takes --profile NAME, --project DIR (a shared project directory
@@ -753,9 +756,126 @@ fn cmdBuild(c: Ctx, s: config.Settings, args: []const []const u8) u8 {
     return rc;
 }
 
+// ---- uninstall ------------------------------------------------------------
+
+const UninstallOpts = struct {
+    dry_run: bool = false,
+    delete: bool = false,
+};
+
+const Found = struct {
+    installs: std.ArrayList([]const u8) = .empty,
+    modules: std.ArrayList([]const u8) = .empty,
+};
+
+/// Below `path`, never through a symbolic link: every software/NAME/VERSION
+/// directory and modules/all/NAME/VERSION.lua file, for every CPU target.
+fn findInstalls(c: Ctx, path: []const u8, name: []const u8, ver: []const u8, found: *Found, depth: usize) void {
+    if (depth > 12) return;
+    const fd = fsx.openDir(fsx.cwd, path, false) catch return;
+    defer sys.close(fd);
+    const base = std.fs.path.basename(path);
+    if (std.mem.eql(u8, base, "software")) {
+        const dir = std.fs.path.join(c.a, &.{ path, name, ver }) catch oom();
+        if (fsx.statAt(fsx.cwd, dir, false)) |st| {
+            if (st.isDir()) found.installs.append(c.a, dir) catch oom();
+        } else |_| {}
+    }
+    if (std.mem.eql(u8, base, "all") and std.mem.eql(u8, std.fs.path.basename(std.fs.path.dirname(path) orelse ""), "modules")) {
+        const file = std.fs.path.join(c.a, &.{ path, name, str(c.a, "{s}.lua", .{ver}) }) catch oom();
+        if (fsx.statAt(fsx.cwd, file, false)) |st| {
+            if (st.isReg()) found.modules.append(c.a, file) catch oom();
+        } else |_| {}
+        return;
+    }
+    var it = fsx.DirIter.init(c.a, fd) catch return;
+    while (it.next() catch null) |e| {
+        const st = fsx.statAt(fd, e.name, false) catch continue;
+        if (!st.isDir()) continue;
+        // The installs themselves are not searched for more installs.
+        if (std.mem.eql(u8, base, "software") and std.mem.eql(u8, e.name, name)) continue;
+        findInstalls(c, std.fs.path.join(c.a, &.{ path, e.name }) catch oom(), name, ver, found, depth + 1);
+    }
+}
+
+/// EasyBuild installs are read-only; the owner may make them writable again.
+fn makeWritable(c: Ctx, path: []const u8, depth: usize) void {
+    if (depth > 64) return;
+    const st = fsx.statAt(fsx.cwd, path, false) catch return;
+    if (st.isLink() or st.uid != linux.getuid()) return;
+    var zb: [sys.path_max:0]u8 = undefined;
+    const zp = sys.z(&zb, path) catch return;
+    _ = linux.fchmodat(linux.AT.FDCWD, zp.ptr, @intCast((st.mode & 0o7777) | 0o200));
+    if (!st.isDir()) return;
+    const fd = fsx.openDir(fsx.cwd, path, false) catch return;
+    defer sys.close(fd);
+    var it = fsx.DirIter.init(c.a, fd) catch return;
+    while (it.next() catch null) |e| makeWritable(c, std.fs.path.join(c.a, &.{ path, e.name }) catch oom(), depth + 1);
+}
+
+fn cmdUninstall(c: Ctx, s: config.Settings, modules: []const []const u8, o: UninstallOpts) u8 {
+    const a = c.a;
+    if (modules.len == 0) die("uninstall needs NAME/VERSION, as module avail shows it", .{});
+    const p = place(c, s);
+    const versions = std.fs.path.join(a, &.{ p.prefix, "versions" }) catch oom();
+    if (fsx.statAt(fsx.cwd, versions, false)) |st| {
+        if (st.isLink()) die("{s} is a symbolic link; uninstall leaves it alone.", .{versions});
+    } else |_| die("nothing is installed in {s}", .{p.prefix});
+    var found: Found = .{};
+    for (modules) |m| {
+        var parts = std.mem.splitScalar(u8, m, '/');
+        const name = parts.next().?;
+        const ver = parts.next() orelse die("uninstall needs NAME/VERSION; '{s}' has no version", .{m});
+        if (parts.next() != null) die("uninstall needs NAME/VERSION; '{s}' has more parts", .{m});
+        const before = found.installs.items.len + found.modules.items.len;
+        findInstalls(c, versions, name, ver, &found, 0);
+        if (found.installs.items.len + found.modules.items.len == before) die("{s} is not installed in {s}", .{ m, p.prefix });
+    }
+    for (found.installs.items) |d| {
+        if (!storage.under(d, versions)) die("{s} is outside {s}", .{ d, versions });
+        say("  {s}/", .{d});
+    }
+    for (found.modules.items) |f| say("  {s}", .{f});
+    if (o.dry_run) {
+        say("eb-local: dry run, nothing removed", .{});
+        return 0;
+    }
+    var trash = s.trash.value;
+    const rtrash = proc.which(a, "rtrash", c.env.get("PATH") orelse "") catch null;
+    switch (trash) {
+        .auto => trash = if (rtrash != null) .rtrash else .none,
+        .rtrash => if (rtrash == null) die("clean.trash is rtrash, but rtrash is not on PATH.", .{}),
+        .none => {},
+    }
+    if (trash != .rtrash and !o.delete) {
+        warn("rtrash is not installed; nothing removed. Install rtrash, or pass --delete to delete for good.", .{});
+        return 1;
+    }
+    for (found.installs.items) |d| makeWritable(c, d, 0);
+    if (trash == .rtrash) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        argv.appendSlice(a, &.{ rtrash.?, "put", "--" }) catch oom();
+        argv.appendSlice(a, found.installs.items) catch oom();
+        argv.appendSlice(a, found.modules.items) catch oom();
+        const rc = runAttached(a, argv.items, c.envp);
+        if (rc != 0) die("rtrash put exited {d}", .{rc});
+        say("eb-local: moved {d} installation(s) and {d} module file(s) to the trash (rtrash restore brings them back)", .{ found.installs.items.len, found.modules.items.len });
+    } else {
+        for (found.installs.items) |d| fsx.deleteTree(a, fsx.cwd, d) catch |e| die("cannot remove {s} ({s})", .{ d, @errorName(e) });
+        for (found.modules.items) |f| sys.unlinkat(fsx.cwd, f, 0) catch |e| die("cannot remove {s} ({s})", .{ f, @errorName(e) });
+        say("eb-local: deleted {d} installation(s) and {d} module file(s)", .{ found.installs.items.len, found.modules.items.len });
+    }
+    // The NAME directories they leave empty.
+    for ([_][]const []const u8{ found.installs.items, found.modules.items }) |list| for (list) |x| {
+        const parent = std.fs.path.dirname(x) orelse continue;
+        sys.unlinkat(fsx.cwd, parent, linux.AT.REMOVEDIR) catch {};
+    };
+    return 0;
+}
+
 // ---- entry ----------------------------------------------------------------
 
-const Command = enum { build, env, dev, clean, config, profiles };
+const Command = enum { build, env, dev, clean, config, profiles, uninstall };
 
 pub fn main(init: std.process.Init) u8 {
     const a = init.arena.allocator();
@@ -790,6 +910,7 @@ pub fn main(init: std.process.Init) u8 {
     var g: Global = .{};
     var rest: std.ArrayList([]const u8) = .empty;
     var clean: CleanOpts = .{};
+    var uninstall: UninstallOpts = .{};
     var check = false;
     var i: usize = 0;
     const value = struct {
@@ -852,6 +973,17 @@ pub fn main(init: std.process.Init) u8 {
                     clean.delete = true;
                 } else die("clean does not know '{s}'", .{x});
             },
+            .uninstall => {
+                if (std.mem.eql(u8, x, "--dry-run")) {
+                    uninstall.dry_run = true;
+                } else if (std.mem.eql(u8, x, "--delete")) {
+                    uninstall.delete = true;
+                } else if (x.len > 0 and x[0] == '-') {
+                    die("uninstall does not know '{s}'", .{x});
+                } else if (!config.validModule(x)) {
+                    die("'{s}' is not a module name", .{x});
+                } else rest.append(a, x) catch oom();
+            },
         }
     }
 
@@ -863,6 +995,7 @@ pub fn main(init: std.process.Init) u8 {
         .config => cmdConfig(c, s, check),
         .clean => cmdClean(c, s, clean),
         .build => cmdBuild(c, s, rest.items),
+        .uninstall => cmdUninstall(c, s, rest.items, uninstall),
         .profiles => unreachable,
     };
 }
