@@ -14,11 +14,26 @@ import unittest
 import binary
 from test_storage import StorageFixture
 
+# Behaves as rtrash put does: rm(1) flags, and a directory without -r is
+# refused with status 1 after the other operands are trashed.
 RTRASH = r'''#!/bin/sh
 [ "$1" = put ] || exit 64
 shift
-[ "$1" = -- ] && shift
-for f in "$@"; do printf '%s\n' "$f" >> "$CONTROL_ROOT/trashed"; chmod -R u+w -- "$f"; rm -rf -- "$f"; done
+rec=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        -r|-R|--recursive) rec=1; shift ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+rc=0
+for f in "$@"; do
+    if [ -d "$f" ] && [ -z "$rec" ]; then echo "rtrash: cannot remove '$f': Is a directory" >&2; rc=1; continue; fi
+    printf '%s\n' "$f" >> "$CONTROL_ROOT/trashed"; chmod -R u+w -- "$f"; rm -rf -- "$f"
+done
+exit $rc
 '''
 
 
@@ -75,6 +90,14 @@ class Uninstall(StorageFixture):
         trashed = (self.root / "trashed").read_text().splitlines()
         self.assertEqual(sorted(trashed), sorted(str(p) for p in self.installs + self.modules))
         self.assertFalse(any(p.exists() for p in self.installs + self.modules))
+
+    def test_a_refused_trash_leaves_the_module_files(self):
+        # An rtrash that refuses the installations: the module files stay.
+        (self.bin / "rtrash").write_text('#!/bin/sh\necho refused >&2\nexit 1\n')
+        (self.bin / "rtrash").chmod(0o755)
+        run = self.run_tool(["uninstall", "pigz/2.8-GCCcore-15.2.0"], PATH=f"{self.bin}:/usr/bin:/bin")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertTrue(all(p.exists() for p in self.installs + self.modules))
 
     def test_refusals(self):
         self.assertEqual(self.run_tool(["uninstall", "absent/1.0"]).returncode, 2)

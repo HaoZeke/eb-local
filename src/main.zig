@@ -933,12 +933,16 @@ fn cmdUninstall(c: Ctx, s: config.Settings, modules: []const []const u8, o: Unin
     }
     for (found.installs.items) |d| makeWritable(c, d, 0);
     if (trash == .rtrash) {
-        var argv: std.ArrayList([]const u8) = .empty;
-        argv.appendSlice(a, &.{ rtrash.?, "put", "--" }) catch oom();
-        argv.appendSlice(a, found.installs.items) catch oom();
-        argv.appendSlice(a, found.modules.items) catch oom();
-        const rc = runAttached(a, argv.items, c.envp);
-        if (rc != 0) die("rtrash put exited {d}", .{rc});
+        // rtrash put follows rm(1): a directory needs -r. The installations
+        // go first, so a refusal leaves every module file in place.
+        for ([_][]const []const u8{ found.installs.items, found.modules.items }) |list| {
+            if (list.len == 0) continue;
+            var argv: std.ArrayList([]const u8) = .empty;
+            argv.appendSlice(a, &.{ rtrash.?, "put", "-r", "--" }) catch oom();
+            argv.appendSlice(a, list) catch oom();
+            const rc = runAttached(a, argv.items, c.envp);
+            if (rc != 0) die("rtrash put exited {d}; nothing after it was moved", .{rc});
+        }
         say("eb-local: moved {d} installation(s) and {d} module file(s) to the trash (rtrash restore brings them back)", .{ found.installs.items.len, found.modules.items.len });
     } else {
         for (found.installs.items) |d| fsx.deleteTree(a, fsx.cwd, d) catch |e| die("cannot remove {s} ({s})", .{ d, @errorName(e) });
