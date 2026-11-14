@@ -8,14 +8,35 @@
 # eb-local
 
 <!-- docs:start -->
-Install software with EasyBuild on top of [EESSI](https://www.eessi.io) 2026.06, into a directory you own.
+Build your own code and install software on top of [EESSI](https://www.eessi.io) (the European Environment for Scientific Software Installations) 2026.06, without knowing EasyBuild's RPATH wrappers, `buildenv` or `LD_LIBRARY_PATH`.
 
 Documentation: <https://stackhands.github.io/eb-local/>
 
-`eb-local` sets `EESSI_USER_INSTALL` (or `EESSI_PROJECT_INSTALL`), loads `EESSI/2026.06` and `EESSI-extend/2026.06-easybuild`, and runs `eb`.
-EESSI-extend supplies EESSI's hooks, RPATH wrappers and compat layer, so what you build links against the same libraries as the EESSI modules.
+## Compile your own code
 
-## Use
+```sh
+eval "$(eb-local dev FFTW/3.3.10-GCC-15.2.0)"
+gcc -O2 -fopenmp prog.c -lfftw3 -o prog
+./prog                      # runs in a new shell or a job, with no modules loaded
+```
+
+`eb-local dev` loads EESSI, the modules you name, and a build environment last, so `gcc`, `mpicc`, `make`, CMake and meson record where each library lives.
+The program then runs without `LD_LIBRARY_PATH`; do not set it, because it can mix the host's libraries into EESSI's.
+Load the modules you link against on the `dev` line, not after it.
+
+These were checked on Snellius with EESSI 2026.06, each program then run with no modules at all:
+
+| task | the line before building |
+|---|---|
+| C with FFTW and OpenMP | `eval "$(eb-local dev FFTW/3.3.10-GCC-15.2.0)"` |
+| MPI | `eval "$(eb-local dev)"`, then `mpicc` |
+| CMake against GSL | `eval "$(eb-local dev GSL/2.8-GCC-15.2.0 CMake/3.31.11-GCCcore-15.2.0)"` |
+| a Python venv, with packages that compile C | `eval "$(eb-local dev Python/3.14.2-GCCcore-15.2.0)"`, then `python -m venv` and `pip install` |
+| R packages into your own library | `eval "$(eb-local dev R/4.6.1-gfbf-2026.1)"`, then `install.packages(..., lib=...)` and `R_LIBS` |
+
+Load EESSI on the node type that will run the program: it picks the binaries for the CPU it finds when it loads.
+
+## Install software with EasyBuild
 
 Build inside a Slurm allocation on the node type that will run the software, because EasyBuild targets the CPU of the node it runs on:
 
@@ -24,10 +45,10 @@ salloc -p <partition> -n 16 -t 02:00:00   # on nodes with a node-local disk
 eb-local GSL-2.8-GCC-15.2.0.eb --robot
 ```
 
-To use the modules in a new shell or job:
+To use what you installed in a new shell or job:
 
 ```sh
-eval "$(eb-local --env)"
+eval "$(eb-local env)"
 module avail
 ```
 
@@ -38,48 +59,101 @@ mkdir -p /path/to/project/eessi && chgrp myproj /path/to/project/eessi && chmod 
 eb-local --project /path/to/project/eessi GSL-2.8-GCC-15.2.0.eb --robot
 ```
 
+A successful build removes its workspace; a failed one keeps it for inspection until the allocation ends.
+
 ## Where things go
 
 | what | where |
 |---|---|
-| installs | `$HOME/.local/eessi`, `EB_LOCAL_PREFIX`, or `--project DIR` |
+| installs | `$HOME/.local/eessi`, the `prefix` setting, or `--project DIR` |
 | build, temporary, cache and EESSI setup directories | a unique workspace in the allocation's node-local mount |
 | downloaded source archives | `<install-prefix>/.eb-local/sources` |
 | build logs | `<install-prefix>/.eb-local/logs` |
 
-Build mode requires a numeric Slurm allocation ID. It derives
-the allocation's node-local directory from the actual user identity and
-allocation, then requires that owned, writable, canonical directory to be
-its own mount of the configured file system type (XFS by default). An inherited shared or nested `TMPDIR` does not select
-the build filesystem. Shared parallel-filesystem paths, tmpfs, enclosing mounts and symlink aliases are refused
-before the installation prefix is created. There is no shared-scratch fallback.
-The scheduler owns the lifetime of the job workspace; sources and logs remain
-with the user or project installation. `--help` and `--env` create no directories
-and require no allocation.
+A build needs a Slurm allocation whose node-local directory is its own mount, of the configured file system type, owned by you.
+Shared parallel-file-system paths, tmpfs, enclosing mounts and symbolic-link aliases are refused before anything is created.
 
-## Site configuration
+## Clean up
 
-The node-local mount and the shared scratch trees differ per site, so they come from `eb-local.conf`.
-`eb-local` reads the first of `EB_LOCAL_CONFIG`, `eb-local.conf` beside the resolved script, and `/etc/eb-local.conf` that exists.
-The file is parsed, never sourced, and is used only when it is a regular file, not a symlink, not writable by group or others, and owned by root, by the owner of the script, or by the caller.
-Without a configured `node_local_root`, build mode stops before it creates anything; `--help` and `--env` need no configuration.
-
-```ini
-# eb-local.conf
-node_local_root = /local/scratch          # allocation mounts are <root>/<user>.<job id>
-node_local_fstype = xfs                   # file system type the allocation mount must have
-shared_scratch = /scratch /scratch-shared # refused as installation prefix
-allocation_hint = salloc -p <partition> -n 16 -t 02:00:00
+```sh
+eb-local clean --dry-run            # what would go
+eb-local clean                      # logs older than 30 days, to the trash with rtrash
+eb-local clean --sources            # downloaded archives too
+eb-local clean --workspaces --no-logs   # inside an allocation: its leftover workspaces
 ```
 
-The node-local root is refused as an installation prefix too. A site's easyconfig installs the file next to the script.
+With [rtrash](https://github.com/HaoZeke/rtrash) on `PATH`, files go to the trash (`rtrash list`, `rtrash restore`); without it, nothing is deleted unless you pass `--delete`.
+`clean` never follows a symbolic link out of the installation directory.
 
-Everything after the options goes to `eb` unchanged, and `eb-local` exits with `eb`'s status.
+## Configuration
+
+Settings come from, lowest first: built-in defaults, the site file, a site profile, your file, your profile, `EB_LOCAL_*` variables, options.
+`eb-local config` prints every setting and where it came from; `eb-local profiles` lists the profiles.
+
+```toml
+# ~/.config/eb-local/config.toml
+default_profile = "mine"
+
+[profile.mine]
+dev.modules = ["FFTW/3.3.10-GCC-15.2.0"]
+
+[profile.group]
+project = "/projects/0/myproj/eessi"
+
+[profile.gpu]
+dev.modules = ["CUDA/13.3.0"]
+```
+
+`eb-local --profile gpu dev` or `EB_LOCAL_PROFILE=gpu` selects a profile.
+The keys are `prefix`, `project`, `stack.module`, `stack.extend`, `dev.buildenv`, `dev.modules`, `build.allocation_hint`, `clean.trash` (`auto`, `rtrash` or `none`), `clean.logs_older_than_days` and `[secrets]`; the variables are `EB_LOCAL_PREFIX`, `EB_LOCAL_PROJECT`, `EB_LOCAL_STACK_MODULE`, `EB_LOCAL_STACK_EXTEND`, `EB_LOCAL_DEV_BUILDENV`, `EB_LOCAL_DEV_MODULES`, `EB_LOCAL_BUILD_ALLOCATION_HINT`, `EB_LOCAL_CLEAN_TRASH` and `EB_LOCAL_CLEAN_LOGS_OLDER_THAN_DAYS`.
+An unknown key, a wrong type, a duplicate key or an unsafe module name is an error naming its file and line, in every profile, selected or not.
+
+The site file (`/etc/eb-local/config.toml`, or `config.toml` beside the program) also holds the storage settings, which only it may set:
+
+```toml
+[storage]
+node_local_root = "/scratch-node"        # allocation mounts are <root>/<user>.<job id>
+node_local_fstype = "xfs"
+shared_scratch = ["/scratch-shared", "/gpfs/scratch1"]
+
+[build]
+allocation_hint = "salloc -p rome -n 16 -t 02:00:00 --constraint=scratch-node"
+```
+
+A configuration file is used only when it is a regular file, not a symbolic link, not writable by group or others, and owned by root, the program's owner or you (a site file) or by you (your file); otherwise eb-local stops.
+A 1.x `eb-local.conf` is read as before.
+
+## Secrets
+
+A build that needs a credential, such as a licence server or a token for a private source mirror, names where it comes from; the value is never written in a configuration file:
+
+```toml
+[secrets]
+LM_LICENSE_FILE = "nimvault:licences/flexlm"   # nimvault get licences/flexlm
+SOURCE_TOKEN = "file:~/.secrets/source-token"   # your file, mode 600
+MIRROR_PASSWORD = "env:MY_MIRROR_PASSWORD"
+```
+
+- Values are read only for a build, after every other check, and go only into `eb`'s environment.
+- `eb-local config --check` reads each secret and reports `ok` or why not, never the value.
+- After the build, every log written during it has each value replaced with `<secret NAME removed by eb-local>`.
+- A secret cannot set `PATH`, `LD_*`, `EESSI_*`, `EASYBUILD_*` or another variable the build depends on.
+- [nimvault](https://github.com/HaoZeke/nimvault) runs with a 30-second deadline; on failure eb-local shows its error output, never what it printed as the value.
 
 ## Install
 
-`eb-local` is one Bash script using GNU coreutils, util-linux `findmnt`, Lmod and an EESSI 2026.06 mount.
-Copy it onto `PATH`, or install it with the matching released easyconfig.
+The static binary, one file per architecture, from a [release](https://github.com/stackhands/eb-local/releases), or `zig build --release=safe` with Zig 0.17.1.
+The Bash script (`eb-local`, 1.x) needs GNU coreutils, util-linux `findmnt`, Lmod and an EESSI 2026.06 mount, and has no configuration files, profiles or secrets.
+A site's easyconfig installs the program and its site configuration.
+
+## Test
+
+```sh
+python3 -m unittest discover -s tests                    # the Bash script
+zig build unit && zig build -Dtest-ops=true test          # the Zig build: unit tests, then the same suite
+```
+
+`tests/site/` holds the acceptance scripts run on Snellius: the development tasks above, and a build inside an allocation.
 
 ## License
 
