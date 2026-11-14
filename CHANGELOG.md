@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.2
+
+* `uninstall` with rtrash passes `-r`: `rtrash put` follows rm(1) and
+  refused the installation directories, so 2.1.1 trashed the module files
+  and left the installations. Installations now go first, in their own
+  call, so a refusal leaves every module file in place. Found by running
+  against rtrash 0.1.4 on Snellius; the test double now refuses a
+  directory without `-r` as rtrash does.
+
 ## 2.1.1
 
 Fixes from an adversarial review of 2.1.0:
