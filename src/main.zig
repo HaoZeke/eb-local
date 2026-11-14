@@ -7,6 +7,7 @@ const cli = common.cli;
 pub const toml = @import("toml.zig");
 pub const config = @import("config.zig");
 pub const secrets = @import("secrets.zig");
+pub const storage = @import("storage.zig");
 
 const tool = "eb-local";
 pub const version = "2.0.0";
@@ -24,4 +25,5 @@ test {
     _ = toml;
     _ = config;
     _ = secrets;
+    _ = storage;
 }
