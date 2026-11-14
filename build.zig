@@ -8,8 +8,14 @@ pub fn build(b: *std.Build) void {
     // out so two builds of one commit are byte-identical.
     const strip = b.option(bool, "strip", "Leave out debug info (default: on for release builds)") orelse (optimize != .debug);
 
+    // The test artifact may read its mount table from EB_LOCAL_TEST_MOUNTINFO;
+    // a release build never can.
+    const test_ops = b.option(bool, "test-ops", "Let tests supply the mount table (test artifacts only)") orelse false;
+    if (test_ops and optimize != .debug) @panic("-Dtest-ops is for test builds only");
+
     const options = b.addOptions();
     options.addOption([]const u8, "commit", commit);
+    options.addOption(bool, "test_ops", test_ops);
 
     const common = b.dependency("zig_common", .{ .target = target, .optimize = optimize });
     const mod = b.createModule(.{
