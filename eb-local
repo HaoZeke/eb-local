@@ -97,6 +97,9 @@ if [ "$mode" = project ] && [ ! -d "$prefix" ]; then
 fi
 if [ -d "$prefix" ]; then
     prefix=$(cd "$prefix" && pwd -P)
+else
+    # Absolute even before it exists, so printed lines work from any directory.
+    prefix=$(readlink -m -- "$prefix") || die "cannot resolve $prefix"
 fi
 
 # Site configuration. The file is parsed, never sourced. It is trusted only
@@ -213,7 +216,14 @@ print_environment() {
     else
         printf 'export EESSI_USER_INSTALL=%q\n' "$prefix"
     fi
-    printf 'module load %q %q\n' "$stack_module" "$extend_module"
+    # EESSI-extend refuses an install directory that does not exist, and Lmod
+    # then undoes the whole load; before the first install there are no
+    # modules of yours to show, so the stack is loaded alone.
+    if [ -d "$prefix" ]; then
+        printf 'module load %q %q\n' "$stack_module" "$extend_module"
+    else
+        printf 'module load %q\n' "$stack_module"
+    fi
 }
 
 eval_hint() {

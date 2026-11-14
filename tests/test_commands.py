@@ -64,16 +64,30 @@ class Commands(StorageFixture):
 
     # -- env and dev ---------------------------------------------------------
 
-    def test_dev_loads_the_named_modules_then_the_build_environment_last(self):
+    def dev_calls(self):
         run = self.run_wrapper(["dev", "GSL/2.8-GCC-15.2.0", "FFTW/3.3.10-GCC-15.2.0"], SLURM_JOB_ID="")
         self.assertEqual(run.returncode, 0, run.stderr)
         replay = self.replay(run.stdout)
         self.assertEqual(replay.returncode, 0, replay.stderr)
-        calls = (self.root / "module-calls").read_text().splitlines()
-        self.assertEqual(calls[-3:], ["load EESSI/2026.06 EESSI-extend/2026.06-easybuild",
-                                      "load GSL/2.8-GCC-15.2.0 FFTW/3.3.10-GCC-15.2.0",
-                                      "load buildenv/default-foss-2026.1"])
+        return (self.root / "module-calls").read_text().splitlines()[-3:]
+
+    def test_dev_loads_the_named_modules_then_the_build_environment_last(self):
+        self.prefix.mkdir(parents=True)
+        self.assertEqual(self.dev_calls(), ["load EESSI/2026.06 EESSI-extend/2026.06-easybuild",
+                                            "load GSL/2.8-GCC-15.2.0 FFTW/3.3.10-GCC-15.2.0",
+                                            "load buildenv/default-foss-2026.1"])
+
+    def test_dev_before_the_first_install_loads_the_stack_without_the_extension(self):
+        # EESSI-extend refuses a missing install directory and Lmod then undoes
+        # the whole load, so with no prefix yet only the stack is loaded.
+        self.assertEqual(self.dev_calls(), ["load EESSI/2026.06",
+                                            "load GSL/2.8-GCC-15.2.0 FFTW/3.3.10-GCC-15.2.0",
+                                            "load buildenv/default-foss-2026.1"])
         self.assertFalse(self.prefix.exists())
+
+    def test_a_relative_prefix_is_printed_absolute(self):
+        run = self.run_wrapper(["env"], SLURM_JOB_ID="", EB_LOCAL_PREFIX="relative/prefix")
+        self.assertIn(f"export EESSI_USER_INSTALL={self.root}/relative/prefix", run.stdout)
 
     def test_dev_refuses_a_module_name_that_is_not_one(self):
         for name in ("GSL; touch injected", "$(touch injected)", "../x", "a b", "-x", "GSL/`id`"):
@@ -86,6 +100,7 @@ class Commands(StorageFixture):
     def test_dev_buildenv_comes_from_the_option_or_the_configuration(self):
         run = self.run_wrapper(["dev", "--buildenv", "buildenv/default-gompi-2026.1"], SLURM_JOB_ID="")
         self.assertTrue(run.stdout.rstrip().endswith("module load buildenv/default-gompi-2026.1"), run.stdout)
+        self.prefix.mkdir(parents=True)
         self.config.write_text(self.config.read_text() + "dev_buildenv = buildenv/mine\nstack_module = 2026\n")
         run = self.run_wrapper(["dev"], SLURM_JOB_ID="")
         self.assertIn("module load 2026 EESSI-extend/2026.06-easybuild", run.stdout)
